@@ -1,0 +1,8 @@
+.env
+*.session
+*.log
+*.db
+positions.json
+seen.json
+__pycache__/
+*.pyc
