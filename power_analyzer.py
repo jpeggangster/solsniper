@@ -20,6 +20,9 @@ Free/keyed APIs used:
 
 import asyncio
 import json
+import math
+import os
+import pickle
 import time
 import sqlite3
 from dataclasses import dataclass, field
@@ -49,9 +52,17 @@ WEIGHTS = {
     "holders":   20,
     "insiders":  20,
     "community": 15,
-    "lore":      15,
+    "lore":      10,   # reduced: sentiment model takes 5 pts
+    "sentiment": 5,    # pump.fun ML sentiment (Pumpdotstudio/pump-fun-sentiment-100k)
     "kol":       10,
 }
+
+# Features expected by the trained sentiment model (order matters)
+_SENTIMENT_FEATURES = [
+    "market_cap", "volume_24h", "liquidity", "holder_count",
+    "top10_holder_pct", "buys_24h", "sells_24h", "bonding_progress",
+]
+_SENTIMENT_MODEL_PATH = os.path.join(os.path.dirname(__file__), "sentiment_model.pkl")
 
 BURN_ADDRS = {
     "1nc1nerator11111111111111111111111111111111",
@@ -139,6 +150,16 @@ class PowerAnalyzer:
         self.openrouter_key = openrouter_key
         self.x_bearer = x_bearer
         self.ledger = ledger or KolLedger()
+        self._sentiment_model = self._load_sentiment_model()
+
+    @staticmethod
+    def _load_sentiment_model():
+        try:
+            with open(_SENTIMENT_MODEL_PATH, "rb") as f:
+                bundle = pickle.load(f)
+            return bundle["model"]
+        except Exception:
+            return None  # graceful fallback if model not trained yet
 
     # ---------- entry point ----------
 
@@ -218,6 +239,7 @@ class PowerAnalyzer:
             v.breakdown["insiders"]  = self._score_insiders(bundle, rug)
             v.breakdown["community"] = self._score_community(dex)
             v.breakdown["lore"]      = await self._score_lore(s, tweet_text, dex)
+            v.breakdown["sentiment"] = self._score_sentiment_ml(dex, holders)
             v.breakdown["kol"]       = self.ledger.kol_score(kol_handle)
 
             v.score = sum(v.breakdown.values())
@@ -243,12 +265,16 @@ class PowerAnalyzer:
                 "liquidity_usd": (p.get("liquidity") or {}).get("usd", 0),
                 "vol_5m":  (p.get("volume") or {}).get("m5", 0),
                 "vol_1h":  (p.get("volume") or {}).get("h1", 0),
+                "vol_24h": (p.get("volume") or {}).get("h24", 0),
                 "buys_5m":  ((p.get("txns") or {}).get("m5") or {}).get("buys", 0),
                 "sells_5m": ((p.get("txns") or {}).get("m5") or {}).get("sells", 0),
                 "buys_1h":  ((p.get("txns") or {}).get("h1") or {}).get("buys", 0),
                 "sells_1h": ((p.get("txns") or {}).get("h1") or {}).get("sells", 0),
+                "buys_24h": ((p.get("txns") or {}).get("h24") or {}).get("buys", 0),
+                "sells_24h":((p.get("txns") or {}).get("h24") or {}).get("sells", 0),
                 "price_change_1h": (p.get("priceChange") or {}).get("h1", 0),
                 "fdv": p.get("fdv", 0),
+                "market_cap": p.get("marketCap", 0) or p.get("fdv", 0),
                 "created_at": p.get("pairCreatedAt", 0),
                 "socials": (p.get("info") or {}).get("socials", []),
             }
@@ -395,17 +421,61 @@ class PowerAnalyzer:
             pts += 3
         return min(w, pts)
 
+    def _score_sentiment_ml(self, dex, holders) -> float:
+        """On-chain sentiment score 0–5 from the Pumpdotstudio/pump-fun-sentiment-100k model.
+        Maps bullish→5, neutral→2.5, bearish→0 weighted by model confidence."""
+        w = WEIGHTS["sentiment"]
+        if self._sentiment_model is None:
+            return w * 0.5  # neutral fallback
+        try:
+            row = []
+            for f in _SENTIMENT_FEATURES:
+                if f == "market_cap":
+                    v = (dex or {}).get("market_cap", 0) or 0
+                elif f == "volume_24h":
+                    v = (dex or {}).get("vol_24h", 0) or 0
+                elif f == "liquidity":
+                    v = (dex or {}).get("liquidity_usd", 0) or 0
+                elif f == "holder_count":
+                    v = (holders or {}).get("n_large", 0) or 0
+                elif f == "top10_holder_pct":
+                    v = (holders or {}).get("top10_pct", 50) or 50
+                elif f == "buys_24h":
+                    v = (dex or {}).get("buys_24h", 0) or 0
+                elif f == "sells_24h":
+                    v = (dex or {}).get("sells_24h", 0) or 0
+                elif f == "bonding_progress":
+                    v = 0  # not fetched; model handles 0 gracefully
+                else:
+                    v = 0
+                # apply same log1p transform as training
+                if f in ("market_cap", "volume_24h", "liquidity"):
+                    v = math.log1p(max(v, 0))
+                row.append(float(v))
+            pred = self._sentiment_model.predict([row])[0]
+            proba = self._sentiment_model.predict_proba([row])[0]
+            confidence = max(proba)
+            # 0=bearish,1=neutral,2=bullish
+            if pred == 2:      # bullish
+                return w * (0.5 + 0.5 * confidence)
+            elif pred == 1:    # neutral
+                return w * 0.4
+            else:              # bearish
+                return w * max(0, 0.3 - 0.3 * confidence)
+        except Exception:
+            return w * 0.5
+
     async def _score_lore(self, s, tweet_text, dex):
-        """LLM lore/narrative score 0–15 via OpenRouter. Falls back to neutral 7."""
+        """LLM lore/narrative score 0–10 via OpenRouter. Falls back to neutral."""
         w = WEIGHTS["lore"]
         if not self.openrouter_key or not tweet_text:
             return w * 0.45
         prompt = (
             "You are scoring a Solana memecoin's narrative power for a trader. "
-            "Score 0-15 considering: originality of the meme/lore (vs derivative copycat), "
+            "Score 0-10 considering: originality of the meme/lore (vs derivative copycat), "
             "cultural timing/relevance, stickiness/virality potential, and whether the "
             "KOL tweet reads organic vs paid shill. Respond ONLY with JSON: "
-            '{"score": <0-15>, "reason": "<10 words>"}\n\n'
+            '{"score": <0-10>, "reason": "<10 words>"}\n\n'
             f"KOL tweet: {tweet_text[:500]}\nFDV: ${dex.get('fdv',0):,.0f}" if dex else ""
         )
         try:

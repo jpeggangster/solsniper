@@ -6,3 +6,4 @@ positions.json
 seen.json
 __pycache__/
 *.pyc
+sentiment_model.pkl
