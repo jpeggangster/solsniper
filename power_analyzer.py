@@ -69,6 +69,19 @@ BURN_ADDRS = {
     "11111111111111111111111111111111",
 }
 
+# Token accounts whose *owner* is one of these programs are LP/AMM pools — exclude from holder calcs
+DEX_PROGRAMS = {
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # pump.fun bonding curve
+    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",  # PumpSwap AMM
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM v4
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  # Raydium CLMM
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",   # Orca Whirlpool
+    "5quBtoiQqxF9Jv6KYKctB59NT3gtFD2XqWNkwhroRufR",  # Orca v1
+    "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP",  # Orca v2
+    "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX",   # Serum DEX v3
+    "MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG",  # Moonshot
+}
+
 # ----------------------------- data types -----------------------------------
 
 @dataclass
@@ -201,7 +214,11 @@ class PowerAnalyzer:
             # ---- final data pulls ----
             dex = await self._dexscreener(s, mint)
             rug = await self._rugcheck(s, mint)
-            holders = await self._top_holders(s, mint)
+            # build LP exclusion set from RugCheck markets + DexScreener pair address
+            lp_addrs = set((rug or {}).get("lp_addrs", set()))
+            if dex and dex.get("pair_address"):
+                lp_addrs.add(dex["pair_address"])
+            holders = await self._top_holders(s, mint, lp_addrs=lp_addrs)
             bundle = await self._bundle_check(s, mint)
             deployer_flag = await self._deployer_history(s, mint, rug)
 
@@ -277,6 +294,7 @@ class PowerAnalyzer:
                 "market_cap": p.get("marketCap", 0) or p.get("fdv", 0),
                 "created_at": p.get("pairCreatedAt", 0),
                 "socials": (p.get("info") or {}).get("socials", []),
+                "pair_address": p.get("pairAddress", ""),
             }
         except Exception:
             return None
@@ -288,10 +306,20 @@ class PowerAnalyzer:
                 d = await r.json()
             markets = d.get("markets") or []
             lp_locked = any((m.get("lp") or {}).get("lpLockedPct", 0) > 90 for m in markets)
+            # collect known LP/pool addresses to exclude from holder counts
+            lp_addrs = set()
+            for m in markets:
+                if m.get("pubkey"):
+                    lp_addrs.add(m["pubkey"])
+                lp = m.get("lp") or {}
+                for key in ("lpMint", "lpVault", "quoteVault", "baseVault"):
+                    if lp.get(key):
+                        lp_addrs.add(lp[key])
             return {
                 "mint_authority": (d.get("token") or {}).get("mintAuthority"),
                 "freeze_authority": (d.get("token") or {}).get("freezeAuthority"),
                 "lp_locked": lp_locked,
+                "lp_addrs": lp_addrs,
                 "risks": [x.get("name") for x in (d.get("risks") or [])],
                 "creator": d.get("creator"),
                 "insider_pct": d.get("graphInsidersDetected", 0),
@@ -305,18 +333,40 @@ class PowerAnalyzer:
                           timeout=aiohttp.ClientTimeout(total=15)) as r:
             return (await r.json()).get("result")
 
-    async def _top_holders(self, s, mint):
+    async def _top_holders(self, s, mint, lp_addrs: set = None):
         try:
             res = await self._rpc(s, "getTokenLargestAccounts", [mint])
             supply = await self._rpc(s, "getTokenSupply", [mint])
             total = float(supply["value"]["uiAmount"]) if supply else 0
             if not res or not total:
                 return None
+
             accts = [a for a in res["value"] if a["address"] not in BURN_ADDRS]
-            # crude LP exclusion: drop the single largest if it's >30% (usually the pool)
-            pcts = sorted((float(a["uiAmount"] or 0) / total * 100 for a in accts), reverse=True)
-            if pcts and pcts[0] > 30:
-                pcts = pcts[1:]
+            if not accts:
+                return None
+
+            # Batch-fetch parsed account info to get the real wallet owner of each
+            # token account — LP/AMM pool accounts will be owned by DEX programs
+            addrs = [a["address"] for a in accts]
+            multi = await self._rpc(s, "getMultipleAccounts",
+                                    [addrs, {"encoding": "jsonParsed"}])
+
+            exclude = set(BURN_ADDRS) | (lp_addrs or set())
+            if multi and multi.get("value"):
+                for addr, info in zip(addrs, multi["value"]):
+                    if not info:
+                        continue
+                    data = info.get("data") or {}
+                    if isinstance(data, dict):
+                        owner = (data.get("parsed") or {}).get("info", {}).get("owner", "")
+                        if owner in DEX_PROGRAMS or addr in exclude:
+                            exclude.add(addr)
+
+            pcts = sorted(
+                (float(a["uiAmount"] or 0) / total * 100
+                 for a in accts if a["address"] not in exclude),
+                reverse=True
+            )
             top10 = sum(pcts[:10])
             return {"top10_pct": top10, "max_single_pct": pcts[0] if pcts else 0,
                     "n_large": len(pcts)}
