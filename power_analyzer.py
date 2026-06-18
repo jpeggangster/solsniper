@@ -359,7 +359,7 @@ class PowerAnalyzer:
                     data = info.get("data") or {}
                     if isinstance(data, dict):
                         owner = (data.get("parsed") or {}).get("info", {}).get("owner", "")
-                        if owner in DEX_PROGRAMS or addr in exclude:
+                        if owner in DEX_PROGRAMS or owner in (lp_addrs or set()) or addr in exclude:
                             exclude.add(addr)
 
             pcts = sorted(
