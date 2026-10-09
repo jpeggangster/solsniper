@@ -1,4 +1,5 @@
 .env
+.env*
 *.session
 *.log
 *.db
@@ -7,3 +8,58 @@ seen.json
 __pycache__/
 *.pyc
 sentiment_model.pkl
+
+# EMA cross bot runtime data
+ema_ticks.jsonl
+ema_cross_trades.jsonl
+ema_cross_positions.json
+ema_watchlist.json
+ema_cross.log
+
+# Runtime data, backups, logs, local tooling
+*.log.*
+*.session-journal
+control_commands.json
+hood_positions*.json
+hood_seen.json
+*.ema-backup
+gt_ticks_*.jsonl
+ema_chart_*.html
+.DS_Store
+.claude/
+Vibe-Trading/
+node_modules/
+
+# ── OS / editor noise ──
+.DS_Store
+**/.DS_Store
+
+# ── secrets & auth state ──
+# *.session already covers the session DB; the journal is a separate file that
+# can hold the same auth material.
+*.session-journal
+
+# ── runtime state (per-wallet, not code) ──
+hood_positions*.json
+hood_seen.json
+control_commands.json
+ema_watchlist.json
+hood_watchlist.json
+
+# ── rotated logs ("*.log" does not match "x.log.1") ──
+*.log.*
+
+# ── recorded data & generated output ──
+*.jsonl
+ema_chart_*.html
+
+# ── local backups taken while refactoring ──
+*.ema-backup
+*.bak
+*.bak.*
+
+# ── vendored third-party checkout (922 MB, has its own repo) ──
+Vibe-Trading/
+
+# ── node deps for the extension's dev tests ──
+node_modules/

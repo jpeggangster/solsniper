@@ -1,0 +1,102 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { width: auto; margin: 0; padding: 12px; font: 12px -apple-system, system-ui, sans-serif;
+         background: #14161a; color: #e6e6e6; }
+  h1 { font-size: 13px; margin: 0 0 8px; letter-spacing: .3px; }
+  .row { display: flex; justify-content: space-between; align-items: center; margin: 5px 0; }
+  .muted { color: #8b93a1; }
+  .box { background: #1c1f26; border: 1px solid #2a2f3a; border-radius: 6px; padding: 8px; margin: 8px 0; }
+  .mono { font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+  button { width: 100%; padding: 9px; border: 0; border-radius: 6px; font-weight: 600;
+           font-size: 13px; cursor: pointer; }
+  #go.start { background: #1f9d55; color: #fff; }
+  #go.stop  { background: #c0392b; color: #fff; }
+  select, input { background: #22262e; color: #e6e6e6; border: 1px solid #333a46;
+                  border-radius: 4px; padding: 3px 5px; font-size: 11px; }
+  #log { max-height: 46vh; overflow-y: auto; }
+  .l { padding: 2px 0; border-bottom: 1px solid #23272f; }
+  .buy { color: #35d07f; } .sell { color: #ff6b6b; } .error { color: #ff8787; }
+  .warn { color: #f0b429; } .dry { color: #7aa2f7; } .start,.stop { color: #c0caf5; }
+  .pill { padding: 1px 6px; border-radius: 999px; font-size: 10px; }
+  .on { background: #1f9d55; } .off { background: #3a3f4b; }
+  .live { background: #c0392b; } .paper { background: #2d6cdf; }
+</style>
+</head>
+<body>
+  <h1>Axiom EMA Cross Bot <span class="muted" style="font-weight:400">· side panel</span></h1>
+
+  <div class="box">
+    <div class="row"><span class="muted">status</span><span id="st" class="pill off">stopped</span></div>
+    <div class="row"><span class="muted">worker</span><span id="wk" class="mono">—</span></div>
+    <div class="row"><span class="muted">chart CA</span><span id="ca" class="mono">—</span></div>
+    <div class="row"><span class="muted">CA override</span>
+      <input id="mca" class="mono" size="16" placeholder="paste 0x… if blank"></div>
+    <div class="row"><span class="muted"></span><a href="#" id="diag" style="color:#7aa2f7">diagnose page</a></div>
+    <div class="row"><span class="muted">EMA now</span><span id="ema" class="mono">—</span></div>
+    <div class="row"><span class="muted">direction</span><span id="dir" class="pill off">—</span></div>
+    <div class="row"><span class="muted">target</span><span id="tgt" class="mono">—</span></div>
+    <div class="row"><span class="muted">bot holds</span><span id="pos" class="mono">flat</span></div>
+    <div class="row"><span class="muted">trades</span><span id="tr" class="mono">0</span></div>
+    <div class="row"><span class="muted">last signal</span><span id="last" class="mono">—</span></div>
+    <div class="row"><span class="muted">marker</span><span id="mk" class="mono">—</span></div>
+    <div class="row"><span class="muted">line pixels</span><span id="ly" class="mono" style="font-size:10px">—</span></div>
+    <div class="row"><span class="muted">why</span><span id="why" class="mono" style="font-size:10px">—</span></div>
+  </div>
+
+  <div class="box">
+    <div class="row"><span class="muted">mode</span>
+      <select id="dry"><option value="1">paper (no keys sent)</option>
+                       <option value="0">LIVE (sends hotkeys)</option></select></div>
+    <input type="hidden" id="src" value="pixels">
+    <div class="row"><span class="muted">line colours 12 / 21</span>
+      <span><input type="color" id="fc" value="#4CAF50" style="width:34px;padding:0">
+            <input type="color" id="sc" value="#EF5350" style="width:34px;padding:0"></span></div>
+    <div class="row"><span class="muted"></span>
+      <a href="#" id="pick" style="color:#7aa2f7">sample chart colours</a></div>
+    <div class="row"><span class="muted">entry gate</span>
+      <select id="trg"><option value="1">need fresh cross column</option>
+                       <option value="0">line positions only</option></select></div>
+    <div class="row" title="How near the newest bar a cross column must be to count as recent. Exits are never gated.">
+      <span class="muted">cross must be within (px)</span>
+      <input id="frw" size="4" value="300"></div>
+    <div class="row"><span class="muted">marker colour</span>
+      <input type="color" id="cc" value="#FFEB3B" style="width:34px;padding:0"></div>
+    <div class="row"><span class="muted">show overlay on chart</span>
+      <input type="checkbox" id="dbg"></div>
+    <div class="row"><span class="muted">swap 12 / 21 lines</span>
+      <input type="checkbox" id="swp"></div>
+    <div class="row" title="Screen pixels of vertical run. Scaled for Retina automatically.">
+      <span class="muted">min column height (px)</span>
+      <input id="mmp" size="4" value="30"></div>
+    <div class="row" title="Dead zone. The lines must be this far apart, as a percent of pane height, before the target flips. Inside the band the target holds — this is what stops whipsaw in chop.">
+      <span class="muted">hysteresis band (% pane)</span>
+      <input id="bnd" size="4" value="0.8"></div>
+    <div class="row"><span class="muted">bar interval</span>
+      <select id="bar"><option value="1" selected>1s</option><option value="5">5s</option>
+                       <option value="15">15s</option><option value="30">30s</option></select></div>
+    <div class="row"><span class="muted">fast EMA is</span>
+      <select id="idx"><option value="1">2nd legend value</option>
+                       <option value="0">1st legend value</option></select></div>
+    <div class="row"><span class="muted">hotkey style</span>
+      <select id="mode"><option value="chord">hold space + key</option>
+                        <option value="sequence">space, then key</option></select></div>
+    <div class="row"><span class="muted">buy / sell key</span>
+      <span><input id="bk" size="2" value="w"> / <input id="sk" size="2" value="f"></span></div>
+  </div>
+
+  <input type="hidden" id="edge" value="0">
+  <input type="hidden" id="cd" value="0">
+  <input type="hidden" id="mx" value="0">
+  <button id="go" class="start">Start bot</button>
+  <div class="row" style="margin-top:8px">
+    <span class="muted">log</span>
+    <span><a href="#" id="copy" style="color:#7aa2f7">copy</a> ·
+          <a href="#" id="clear" style="color:#8b93a1">clear</a></span>
+  </div>
+  <div class="box" id="log"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

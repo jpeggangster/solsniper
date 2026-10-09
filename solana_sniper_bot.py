@@ -38,6 +38,7 @@ from solders.pubkey import Pubkey  # type: ignore
 from solana.rpc.types import TxOpts
 import base58
 from power_analyzer import PowerAnalyzer, KolLedger, DELAY_WINDOW_SEC
+import ema_strategy
 
 load_dotenv()
 
@@ -64,21 +65,11 @@ TWITTER_EMAIL          = os.getenv("TWITTER_EMAIL", "")
 TWITTER_EMAIL_PASSWORD = os.getenv("TWITTER_EMAIL_PASSWORD", "")
 TWITTER_POLL_SEC       = int(os.getenv("TWITTER_POLL_SEC", "60"))
 
-BUY_AMOUNT_SOL    = 0.18         # SOL per trade
-STOP_LOSS_PCT     = -0.60        # sell 100% at -60%
+BUY_AMOUNT_SOL    = 0.18         # SOL per trade (used as fallback / default size)
 SLIPPAGE_PCT      = 25           # 25% slippage
 PRIORITY_FEE_SOL  = 0.001        # priority fee in SOL
-POLL_INTERVAL_SEC = 10           # how often to check price for open positions
-
-# Tiered take-profit: (gain_pct, sell_fraction_of_remaining)
-# gain_pct  = required gain from entry (1.0 = +100%)
-# sell_frac = fraction of current token balance to sell at this level
-TAKE_PROFIT_LEVELS = [
-    {"gain_pct": 1.00, "sell_frac": 0.50},  # +100% → sell 50%
-    {"gain_pct": 2.00, "sell_frac": 0.33},  # +200% → sell 33%
-    {"gain_pct": 3.00, "sell_frac": 0.25},  # +300% → sell 25%
-    {"gain_pct": 5.00, "sell_frac": 0.16},  # +500% → sell 16%
-]
+CANDLE_POLL_SEC   = 15           # how often to poll price while building live 1m candles
+WATCH_TIMEOUT_SEC = 3600         # give up watching for an EMA55 breakout after 1 hour
 
 # ─── REGEX: Solana CA (base58, 32-44 chars, not a known non-CA) ───────────────
 CA_PATTERN = re.compile(r'\b[1-9A-HJ-NP-Za-km-z]{32,44}\b')
@@ -128,6 +119,23 @@ def load_seen() -> set:
 
 positions: dict = load_positions()
 already_seen: set = load_seen() | set(positions.keys())
+
+# ─── EMA55(1m, DexPaprika) STRATEGY STATE ─────────────────────────────────────
+# Candle/EMA state is in-memory only, not persisted — but since candles are
+# fetched fresh from DexPaprika's real history on every startup (via backfill),
+# a reopened position's EMA55 is live again almost immediately, not after a
+# fresh warmup, as long as the token has 55+ minutes of real trading history.
+TRACKED: dict = {}
+for _ca, _pos in positions.items():
+    _pool = ema_strategy.resolve_pool(_ca)
+    _t = ema_strategy.new_tracker(size_sol=_pos.get("amount_sol", BUY_AMOUNT_SOL), pool_address=_pool)
+    _t["in_position"] = True
+    if _pool:
+        ema_strategy.backfill(_t)
+        log.info(f"Resumed {_ca} — pool={_pool} ema={_t['ema']}")
+    else:
+        log.warning(f"No DexPaprika pool found for {_ca} — EMA55 exit inactive until pool resolves")
+    TRACKED[_ca] = _t
 
 # ─── WALLET ───────────────────────────────────────────────────────────────────
 def load_keypair() -> Keypair:
@@ -220,7 +228,6 @@ def buy_token(ca: str, sol_amount: float = BUY_AMOUNT_SOL):
             "buy_time": time.time(),
             "amount_sol": sol_amount,
             "sig": sig,
-            "tp_hit": [False] * len(TAKE_PROFIT_LEVELS),
         }
         save_positions()
         log.info(f"✅ Position opened: {ca} @ ${buy_price}")
@@ -265,39 +272,67 @@ def sell_token(ca: str, reason: str, sell_frac: float = 1.0) -> bool:
         notify(f"⚠️ <b>SELL FAILED</b> — {reason}\n<code>{ca}</code>")
         return False
 
-# ─── POSITION MONITOR ─────────────────────────────────────────────────────────
-async def monitor_positions():
+# ─── WATCHLIST + POSITION MONITOR (EMA55 / 1m via DexPaprika) ─────────────────
+async def add_to_watchlist(ca: str, size_sol: float, kol_handle: str):
+    """Resolve the token's pool, backfill real 1m history, then watch for an EMA55 upcross."""
+    if ca in TRACKED:
+        return
+    loop = asyncio.get_event_loop()
+    pool = await loop.run_in_executor(None, ema_strategy.resolve_pool, ca)
+    t = ema_strategy.new_tracker(size_sol=size_sol, kol_handle=kol_handle, pool_address=pool)
+    TRACKED[ca] = t
+
+    if pool:
+        await loop.run_in_executor(None, ema_strategy.backfill, t)
+        status = "EMA55 ready" if t["ema"] is not None else f"only {len(t['candles'])}/{ema_strategy.EMA_PERIOD} candles so far — still warming up"
+    else:
+        status = "no DexPaprika pool found yet — will retry"
+
+    log.info(f"👀 Watching {ca} for EMA55(1m) breakout — size {size_sol} SOL ({status})")
+    notify(f"👀 <b>Watching for EMA55(1m) breakout</b>\n<code>{ca}</code>\nSize: {size_sol} SOL\n{status}")
+
+async def monitor_tracked():
+    loop = asyncio.get_event_loop()
     while True:
-        await asyncio.sleep(POLL_INTERVAL_SEC)
-        for ca, pos in list(positions.items()):
-            current_price = get_price_usd(ca)
-            if current_price is None:
-                continue
-            buy_price = pos["buy_price"]
-            if buy_price is None or buy_price == 0:
-                pos["buy_price"] = current_price
-                continue
+        await asyncio.sleep(CANDLE_POLL_SEC)
+        now = time.time()
+        for ca, t in list(TRACKED.items()):
+            if not t["pool_address"]:
+                t["pool_address"] = await loop.run_in_executor(None, ema_strategy.resolve_pool, ca)
+                if t["pool_address"]:
+                    await loop.run_in_executor(None, ema_strategy.backfill, t)
 
-            change = (current_price - buy_price) / buy_price
-            log.info(f"📊 {ca[:8]}... | entry=${buy_price:.6f} | now=${current_price:.6f} | {change*100:+.1f}%")
-
-            # Stop-loss: sell everything
-            if change <= STOP_LOSS_PCT:
-                sell_token(ca, f"STOP LOSS {change*100:+.1f}%", sell_frac=1.0)
+            price = await loop.run_in_executor(None, get_price_usd, ca)
+            if price is None:
                 continue
 
-            # Tiered take-profits (check highest first so we don't double-fire lower ones)
-            for i in range(len(TAKE_PROFIT_LEVELS) - 1, -1, -1):
-                if pos["tp_hit"][i]:
-                    continue
-                tp = TAKE_PROFIT_LEVELS[i]
-                if change >= tp["gain_pct"]:
-                    label = f"TP{i+1} +{tp['gain_pct']*100:.0f}%"
-                    success = sell_token(ca, label, sell_frac=tp["sell_frac"])
-                    if success:
-                        pos["tp_hit"][i] = True  # only mark done after confirmed sell
-                        save_positions()
-                    break  # only fire one TP per poll cycle
+            signal = ema_strategy.ingest_price(t, price, now=now)
+
+            if signal == "buy":
+                log.info(f"📈 EMA55(1m) upcross — buying {ca}")
+                await loop.run_in_executor(None, buy_token, ca, t["size_sol"])
+                if ca in positions:
+                    t["in_position"] = True
+                else:
+                    TRACKED.pop(ca, None)  # buy failed, stop chasing it
+
+            elif signal == "sell":
+                log.info(f"📉 EMA55(1m) close below EMA — selling {ca}")
+                success = await loop.run_in_executor(None, sell_token, ca, "EMA55(1m) close below EMA", 1.0)
+                if success:
+                    # Allow re-entry: keep watching, give it a fresh timeout window
+                    # to find the next breakout instead of dropping it for good.
+                    t["in_position"] = False
+                    t["added_at"] = now
+                elif ca not in positions:
+                    TRACKED.pop(ca, None)  # bot gave up after repeated sell failures — needs manual attention
+                # else: sell failed but position still open — leave tracked (in_position=True)
+                # so the next closed candle retries the exit
+
+            elif not t["in_position"] and now - t["added_at"] > WATCH_TIMEOUT_SEC:
+                log.info(f"⌛ Gave up watching {ca} — no EMA55 breakout within {WATCH_TIMEOUT_SEC}s")
+                notify(f"⌛ <b>Gave up watching</b> — no breakout\n<code>{ca}</code>")
+                TRACKED.pop(ca, None)
 
 # ─── ANALYZE + BUY PIPELINE ───────────────────────────────────────────────────
 async def analyze_and_buy(ca: str, tweet_id: str, tweet_text: str, kol_handle: str):
@@ -336,11 +371,10 @@ async def analyze_and_buy(ca: str, tweet_id: str, tweet_text: str, kol_handle: s
 
         breakdown = " | ".join(f"{k}:{v:.0f}" for k, v in verdict.breakdown.items())
         notify(
-            f"📊 <b>Score {verdict.score:.0f}/100</b> — buying {verdict.size_sol} SOL\n"
+            f"📊 <b>Score {verdict.score:.0f}/100</b> — watching, size {verdict.size_sol} SOL\n"
             f"<code>{ca}</code>\n{breakdown}"
         )
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, buy_token, ca, verdict.size_sol)
+        await add_to_watchlist(ca, verdict.size_sol, kol_handle)
 
     except Exception as e:
         log.error(f"analyze_and_buy error for {ca}: {e}")
@@ -549,9 +583,133 @@ def extract_cas(text: str) -> list[str]:
     matches = CA_PATTERN.findall(text)
     return [m for m in matches if is_valid_solana_ca(m) and m.endswith("pump")]
 
+# ─── MANUAL CONTROL COMMANDS (via the notify bot, long-polling getUpdates) ────
+def _tg_get_updates(offset: Optional[int]) -> list:
+    try:
+        params = {"timeout": 20}
+        if offset is not None:
+            params["offset"] = offset
+        r = requests.get(
+            f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/getUpdates",
+            params=params, timeout=25,
+        )
+        return r.json().get("result", [])
+    except Exception as e:
+        log.warning(f"Control command poll failed: {e}")
+        return []
+
+async def handle_control_command(text: str):
+    parts = text.split()
+    cmd = parts[0].lower()
+    arg = parts[1] if len(parts) > 1 else ""
+    loop = asyncio.get_event_loop()
+
+    if cmd == "/watch":
+        if not arg or not is_valid_solana_ca(arg):
+            notify("⚠️ Usage: /watch <CA> [size_sol]")
+            return
+        if arg in positions:
+            notify(f"⚠️ Already holding a position in <code>{arg}</code>")
+            return
+        try:
+            size = float(parts[2]) if len(parts) > 2 else BUY_AMOUNT_SOL
+        except ValueError:
+            notify("⚠️ size_sol must be a number")
+            return
+        already_seen.add(arg)
+        save_seen()
+        await add_to_watchlist(arg, size, kol_handle="manual")
+
+    elif cmd == "/stop":
+        if not arg:
+            notify("⚠️ Usage: /stop <CA>")
+            return
+        had_position = arg in positions
+        removed = TRACKED.pop(arg, None) is not None
+        if not removed:
+            notify(f"ℹ️ <code>{arg}</code> wasn't being tracked")
+            return
+        if had_position:
+            notify(
+                f"🛑 Stopped automated trading for <code>{arg}</code>\n"
+                f"⚠️ Position is still OPEN with no automated exit — use /sell {arg} to close it"
+            )
+        else:
+            notify(f"🛑 Stopped watching <code>{arg}</code>")
+
+    elif cmd == "/sell":
+        if not arg:
+            notify("⚠️ Usage: /sell <CA>")
+            return
+        if arg not in positions:
+            notify(f"⚠️ No open position in <code>{arg}</code>")
+            return
+        await loop.run_in_executor(None, sell_token, arg, "manual /sell command", 1.0)
+        TRACKED.pop(arg, None)
+
+async def monitor_control_commands():
+    """Listen for /watch, /stop, /sell sent to the notify bot's chat."""
+    if not NOTIFY_BOT_TOKEN or not NOTIFY_CHAT_ID:
+        log.info("Control commands disabled — NOTIFY_BOT_TOKEN/NOTIFY_CHAT_ID not set")
+        return
+
+    loop = asyncio.get_event_loop()
+    offset = None
+    log.info("🎮 Listening for /watch, /stop, /sell commands...")
+    while True:
+        updates = await loop.run_in_executor(None, _tg_get_updates, offset)
+        for upd in updates:
+            offset = upd["update_id"] + 1
+            msg = upd.get("message") or upd.get("channel_post")
+            if not msg:
+                continue
+            if str(msg.get("chat", {}).get("id")) != str(NOTIFY_CHAT_ID):
+                continue
+            text = (msg.get("text") or "").strip()
+            if not text.startswith("/"):
+                continue
+            try:
+                await handle_control_command(text)
+            except Exception as e:
+                log.warning(f"Control command error ({text!r}): {e}")
+                notify(f"⚠️ Command error: {e}")
+
+# ─── FILE-BASED CONTROL CHANNEL (fallback, independent of Telegram) ───────────
+# Write a JSON list of command strings (e.g. ["/watch <CA> 0.18"]) to this file;
+# it's picked up within a few seconds and then cleared.
+CONTROL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "control_commands.json")
+
+def _read_control_commands() -> list:
+    import json
+    try:
+        if not os.path.exists(CONTROL_FILE):
+            return []
+        with open(CONTROL_FILE, "r") as f:
+            cmds = json.load(f)
+        if cmds:
+            with open(CONTROL_FILE, "w") as f:
+                json.dump([], f)
+        return cmds
+    except Exception as e:
+        log.warning(f"Failed to read control file: {e}")
+        return []
+
+async def monitor_control_file():
+    log.info(f"📄 Watching {CONTROL_FILE} for manual commands...")
+    while True:
+        await asyncio.sleep(5)
+        for text in _read_control_commands():
+            try:
+                await handle_control_command(text)
+            except Exception as e:
+                log.warning(f"Control file command error ({text!r}): {e}")
+                notify(f"⚠️ Command error: {e}")
+
 async def main():
     log.info("🚀 Sniper bot running (Twitter-only mode)...")
-    asyncio.ensure_future(monitor_positions())
+    asyncio.ensure_future(monitor_tracked())
+    asyncio.ensure_future(monitor_control_commands())
+    asyncio.ensure_future(monitor_control_file())
     await monitor_twitter()  # runs forever; keeps the loop alive
 
 if __name__ == "__main__":

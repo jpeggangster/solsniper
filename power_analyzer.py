@@ -220,15 +220,11 @@ class PowerAnalyzer:
                 lp_addrs.add(dex["pair_address"])
             holders = await self._top_holders(s, mint, lp_addrs=lp_addrs)
             bundle = await self._bundle_check(s, mint)
-            deployer_flag = await self._deployer_history(s, mint, rug)
 
             # ---- HARD GATES ----
             gates = []
             if not dex:
                 gates.append("no DexScreener pair")
-            else:
-                if dex["liquidity_usd"] < MIN_LIQUIDITY_USD:
-                    gates.append(f"liquidity ${dex['liquidity_usd']:,.0f} < ${MIN_LIQUIDITY_USD:,}")
             if rug:
                 if rug.get("mint_authority"):
                     gates.append("mint authority NOT revoked")
@@ -242,8 +238,6 @@ class PowerAnalyzer:
                 gates.append(f"single wallet {holders['max_single_pct']:.0f}% > {MAX_SINGLE_HOLDER_PCT}%")
             if bundle and bundle["bundle_pct"] > MAX_BUNDLE_PCT:
                 gates.append(f"bundle bought {bundle['bundle_pct']:.0f}% of supply")
-            if deployer_flag:
-                gates.append(deployer_flag)
 
             if gates:
                 v.gate_failures = gates

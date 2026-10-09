@@ -1,0 +1,69 @@
+{
+  "manifest_version": 3,
+  "name": "Axiom EMA Cross Bot",
+  "version": "1.0.0",
+  "description": "Watches the EMA12/21 cross on the open Axiom chart and fires Axiom's own buy/sell hotkeys.",
+  "permissions": [
+    "debugger",
+    "storage",
+    "tabs",
+    "scripting",
+    "webNavigation",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://axiom.trade/*",
+    "https://*.axiom.trade/*",
+    "https://*.tradingview.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Axiom EMA Bot \u2014 open side panel"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://axiom.trade/*",
+        "https://*.axiom.trade/*",
+        "https://*.tradingview.com/*"
+      ],
+      "js": [
+        "inject.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN",
+      "match_origin_as_fallback": true
+    },
+    {
+      "matches": [
+        "https://axiom.trade/*",
+        "https://*.axiom.trade/*",
+        "https://*.tradingview.com/*"
+      ],
+      "js": [
+        "pixels.js",
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_origin_as_fallback": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "inject.js"
+      ],
+      "matches": [
+        "https://axiom.trade/*",
+        "https://*.axiom.trade/*"
+      ]
+    }
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  }
+}
