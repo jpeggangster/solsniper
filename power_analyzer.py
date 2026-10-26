@@ -16,6 +16,9 @@ Free/keyed APIs used:
   - RugCheck     (no key)        : mint/freeze authority, LP lock, top holders, risks
   - Helius RPC   (free tier key) : holder accounts, deployer history, bundle detection
   - OpenRouter   (optional)      : lore/narrative scoring via LLM
+  - MadeOnSol    (optional key)  : rug-risk score, deployer self-activity, bundle cohort
+                                   holdings, KOL consensus (https://madeonsol.com/api/v1,
+                                   Bearer msk_… key; free tier = 200 req/day)
 """
 
 import asyncio
@@ -39,6 +42,9 @@ MIN_LIQUIDITY_USD = 10_000      # hard gate
 MAX_TOP10_PCT = 35.0            # excl. LP & burn wallets; above this = gate fail
 MAX_SINGLE_HOLDER_PCT = 8.0     # excl. LP
 MAX_BUNDLE_PCT = 25.0           # supply bought in launch-slot cluster
+MAX_MOS_RISK = 70               # MadeOnSol risk_score (0-100, higher = riskier) gate
+
+MADEONSOL_BASE = "https://madeonsol.com/api/v1"
 
 TIERS = [                       # (min_score, sol_size)
     (85, 1.00),
@@ -158,9 +164,11 @@ class KolLedger:
 
 class PowerAnalyzer:
     def __init__(self, helius_key: str, openrouter_key: Optional[str] = None,
-                 x_bearer: Optional[str] = None, ledger: Optional[KolLedger] = None):
+                 x_bearer: Optional[str] = None, ledger: Optional[KolLedger] = None,
+                 madeonsol_key: Optional[str] = None):
         self.helius = f"https://mainnet.helius-rpc.com/?api-key={helius_key}"
         self.openrouter_key = openrouter_key
+        self.madeonsol_key = madeonsol_key or os.getenv("MADEONSOL_API_KEY") or None
         self.x_bearer = x_bearer
         self.ledger = ledger or KolLedger()
         self._sentiment_model = self._load_sentiment_model()
@@ -220,6 +228,11 @@ class PowerAnalyzer:
                 lp_addrs.add(dex["pair_address"])
             holders = await self._top_holders(s, mint, lp_addrs=lp_addrs)
             bundle = await self._bundle_check(s, mint)
+            mos = await self._madeonsol(s, mint)
+            if mos.get("bundle_pct") is not None:
+                # real bundle-cohort holdings beat the launch-slot tx-count heuristic
+                bundle = {"bundle_pct": mos["bundle_pct"], "launch_slot_txs": None}
+            v.notes.extend(mos.get("notes", []))
 
             # ---- HARD GATES ----
             gates = []
@@ -238,6 +251,10 @@ class PowerAnalyzer:
                 gates.append(f"single wallet {holders['max_single_pct']:.0f}% > {MAX_SINGLE_HOLDER_PCT}%")
             if bundle and bundle["bundle_pct"] > MAX_BUNDLE_PCT:
                 gates.append(f"bundle bought {bundle['bundle_pct']:.0f}% of supply")
+            if mos.get("risk_score") is not None and mos["risk_score"] >= MAX_MOS_RISK:
+                gates.append(f"MadeOnSol risk {mos['risk_score']:.0f}/100 ({mos.get('risk_band')})")
+            if mos.get("dev_dumped"):
+                gates.append(f"deployer {mos['dev_dumped']}")
 
             if gates:
                 v.gate_failures = gates
@@ -247,11 +264,11 @@ class PowerAnalyzer:
             # ---- SCORING ----
             v.breakdown["volume"]    = self._score_volume(dex)
             v.breakdown["holders"]   = self._score_holders(holders, dex)
-            v.breakdown["insiders"]  = self._score_insiders(bundle, rug)
+            v.breakdown["insiders"]  = self._score_insiders(bundle, rug, mos)
             v.breakdown["community"] = self._score_community(dex)
             v.breakdown["lore"]      = await self._score_lore(s, tweet_text, dex)
             v.breakdown["sentiment"] = self._score_sentiment_ml(dex, holders)
-            v.breakdown["kol"]       = self.ledger.kol_score(kol_handle)
+            v.breakdown["kol"]       = self._score_kol(kol_handle, mos)
 
             v.score = sum(v.breakdown.values())
 
@@ -320,6 +337,52 @@ class PowerAnalyzer:
             }
         except Exception:
             return None
+
+    async def _madeonsol(self, s, mint) -> dict:
+        """MadeOnSol intel: /risk (PRO+), /bundle (all tiers), /kol-consensus.
+        Each endpoint fails independently; missing key or tier → field absent."""
+        out = {"notes": []}
+        if not self.madeonsol_key:
+            return out
+        headers = {"Authorization": f"Bearer {self.madeonsol_key}",
+                   "Accept": "application/json"}
+
+        async def get(path):
+            try:
+                async with s.get(f"{MADEONSOL_BASE}{path}", headers=headers,
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status != 200:
+                        out["notes"].append(f"madeonsol {path.rsplit('/', 1)[-1]}: HTTP {r.status}")
+                        return None
+                    return await r.json()
+            except Exception:
+                return None
+
+        risk, bundle, cons = await asyncio.gather(
+            get(f"/tokens/{mint}/risk"),
+            get(f"/tokens/{mint}/bundle"),
+            get(f"/tokens/{mint}/kol-consensus"),
+        )
+
+        if risk and risk.get("risk_score") is not None:
+            out["risk_score"] = float(risk["risk_score"])
+            out["risk_band"] = risk.get("band")
+            dev = risk.get("dev") or {}
+            if dev.get("transferred_out"):
+                out["dev_dumped"] = "moved tokens out without a swap"
+            elif dev.get("wallet_empty") and (dev.get("sold_tokens") or 0) > 0:
+                out["dev_dumped"] = "sold out entirely"
+
+        b = (bundle or {}).get("bundle") or {}
+        if b.get("held_pct_of_supply") is not None:
+            out["bundle_pct"] = float(b["held_pct_of_supply"]) * 100  # API gives 0-1
+
+        if cons is not None:
+            c = cons.get("consensus") or {}
+            out["kol_buyers"] = c.get("total_kol_buyers", cons.get("total_kol_buyers", 0)) or 0
+            out["kol_exit_rate"] = c.get("kol_exit_rate")
+            out["kol_net_flow_sol"] = c.get("net_flow_sol", 0) or 0
+        return out
 
     async def _rpc(self, s, method, params):
         async with s.post(self.helius, json={"jsonrpc": "2.0", "id": 1,
@@ -438,7 +501,7 @@ class PowerAnalyzer:
             pts += 2
         return min(w, pts)
 
-    def _score_insiders(self, bundle, rug):
+    def _score_insiders(self, bundle, rug, mos=None):
         w = WEIGHTS["insiders"]
         pts = float(w)
         if bundle:
@@ -446,7 +509,24 @@ class PowerAnalyzer:
         if rug:
             pts -= min(8, rug.get("insider_pct", 0) * 0.4)
             pts -= 2 * len([r for r in rug.get("risks", []) if "insider" in (r or "").lower()])
+        if mos and mos.get("risk_score") is not None:
+            pts -= min(8, mos["risk_score"] * 0.1)        # MadeOnSol composite rug risk
         return max(0.0, min(w, pts))
+
+    def _score_kol(self, kol_handle, mos=None):
+        """Our own KOL ledger, blended 50/50 with MadeOnSol's on-chain KOL
+        consensus when available (more KOL wallets in, net buying, few exits)."""
+        w = WEIGHTS["kol"]
+        ledger = self.ledger.kol_score(kol_handle)
+        if not mos or "kol_buyers" not in mos:
+            return ledger
+        pts = min(5.0, mos["kol_buyers"] * 1.0)
+        if mos["kol_net_flow_sol"] > 0:
+            pts += 2.5
+        exit_rate = mos.get("kol_exit_rate")
+        if exit_rate is not None:
+            pts += 2.5 * (1 - min(1.0, exit_rate))
+        return max(0.0, min(w, 0.5 * ledger + 0.5 * pts))
 
     def _score_community(self, dex):
         w = WEIGHTS["community"]

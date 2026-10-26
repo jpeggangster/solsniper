@@ -387,6 +387,7 @@ NOTIFY_BOT_TOKEN = os.getenv("NOTIFY_BOT_TOKEN", "")
 NOTIFY_CHAT_ID   = os.getenv("NOTIFY_CHAT_ID", "")
 
 OPENROUTER_KEY   = os.getenv("OPENROUTER_KEY", "")  # optional: LLM lore scoring
+MADEONSOL_API_KEY = os.getenv("MADEONSOL_API_KEY", "")  # optional: MadeOnSol risk/bundle/KOL intel
 
 # ─── POWER ANALYZER ───────────────────────────────────────────────────────────
 _helius_key = RPC_URL.split("api-key=")[-1] if "api-key=" in RPC_URL else ""
@@ -394,6 +395,7 @@ PA = PowerAnalyzer(
     helius_key=_helius_key,
     openrouter_key=OPENROUTER_KEY or None,
     x_bearer=None,  # free tier bearer doesn't support tweet lookup
+    madeonsol_key=MADEONSOL_API_KEY or None,
 )
 
 NITTER_INSTANCES = [
