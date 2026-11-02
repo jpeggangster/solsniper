@@ -88,6 +88,12 @@ DEX_PROGRAMS = {
     "MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG",  # Moonshot
 }
 
+def _tier_size(score: float) -> float:
+    for floor, size in TIERS:
+        if score >= floor:
+            return size
+    return 0.0
+
 # ----------------------------- data types -----------------------------------
 
 @dataclass
@@ -100,6 +106,10 @@ class Verdict:
     gate_failures: list = field(default_factory=list)
     breakdown: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)
+    # paper-test bookkeeping (see mos_paper.py)
+    entry: dict = field(default_factory=dict)     # price/liq/mcap at decision time
+    mos: dict = field(default_factory=dict)       # MadeOnSol snapshot at decision time
+    legacy: dict = field(default_factory=dict)    # what the pre-MadeOnSol pipeline would have done
 
     def summary(self) -> str:
         if not self.gates_passed:
@@ -186,6 +196,16 @@ class PowerAnalyzer:
 
     async def analyze(self, mint: str, tweet_id: str, kol_handle: str,
                       tweet_text: str = "") -> Verdict:
+        v = await self._analyze(mint, tweet_id, kol_handle, tweet_text)
+        try:
+            import mos_paper
+            mos_paper.record_verdict(v, kol_handle=kol_handle, tweet_id=tweet_id)
+        except Exception:
+            pass  # paper logging must never break trading
+        return v
+
+    async def _analyze(self, mint: str, tweet_id: str, kol_handle: str,
+                       tweet_text: str = "") -> Verdict:
         v = Verdict(mint=mint, buy=False, size_sol=0.0, score=0.0, gates_passed=False)
 
         if self.ledger.is_blacklisted(mint):
@@ -227,12 +247,16 @@ class PowerAnalyzer:
             if dex and dex.get("pair_address"):
                 lp_addrs.add(dex["pair_address"])
             holders = await self._top_holders(s, mint, lp_addrs=lp_addrs)
-            bundle = await self._bundle_check(s, mint)
+            legacy_bundle = bundle = await self._bundle_check(s, mint)
             mos = await self._madeonsol(s, mint)
             if mos.get("bundle_pct") is not None:
                 # real bundle-cohort holdings beat the launch-slot tx-count heuristic
                 bundle = {"bundle_pct": mos["bundle_pct"], "launch_slot_txs": None}
             v.notes.extend(mos.get("notes", []))
+            v.mos = {k: val for k, val in mos.items() if k != "notes"}
+            if dex:
+                v.entry = {"price": dex.get("price_usd"), "liq": dex.get("liquidity_usd"),
+                           "mcap": dex.get("market_cap")}
 
             # ---- HARD GATES ----
             gates = []
@@ -249,6 +273,9 @@ class PowerAnalyzer:
                 gates.append(f"top10 hold {holders['top10_pct']:.0f}% > {MAX_TOP10_PCT}%")
             if holders and holders["max_single_pct"] > MAX_SINGLE_HOLDER_PCT:
                 gates.append(f"single wallet {holders['max_single_pct']:.0f}% > {MAX_SINGLE_HOLDER_PCT}%")
+            legacy_gates = list(gates)
+            if legacy_bundle and legacy_bundle["bundle_pct"] > MAX_BUNDLE_PCT:
+                legacy_gates.append("bundle (heuristic)")
             if bundle and bundle["bundle_pct"] > MAX_BUNDLE_PCT:
                 gates.append(f"bundle bought {bundle['bundle_pct']:.0f}% of supply")
             if mos.get("risk_score") is not None and mos["risk_score"] >= MAX_MOS_RISK:
@@ -256,26 +283,37 @@ class PowerAnalyzer:
             if mos.get("dev_dumped"):
                 gates.append(f"deployer {mos['dev_dumped']}")
 
+            v.legacy = {"buy": False, "size": 0.0, "score": 0.0, "gates": legacy_gates}
+            if gates and legacy_gates:
+                v.gate_failures = gates
+                return v
+
+            # ---- SCORING ----
+            common = {
+                "volume":    self._score_volume(dex),
+                "holders":   self._score_holders(holders, dex),
+                "community": self._score_community(dex),
+                "lore":      await self._score_lore(s, tweet_text, dex),
+                "sentiment": self._score_sentiment_ml(dex, holders),
+            }
+
+            if not legacy_gates:
+                legacy_score = sum(common.values()) + self._score_insiders(legacy_bundle, rug) \
+                    + self.ledger.kol_score(kol_handle)
+                legacy_size = _tier_size(legacy_score)
+                v.legacy.update(score=legacy_score, buy=legacy_size > 0, size=legacy_size)
+
             if gates:
                 v.gate_failures = gates
                 return v
             v.gates_passed = True
 
-            # ---- SCORING ----
-            v.breakdown["volume"]    = self._score_volume(dex)
-            v.breakdown["holders"]   = self._score_holders(holders, dex)
-            v.breakdown["insiders"]  = self._score_insiders(bundle, rug, mos)
-            v.breakdown["community"] = self._score_community(dex)
-            v.breakdown["lore"]      = await self._score_lore(s, tweet_text, dex)
-            v.breakdown["sentiment"] = self._score_sentiment_ml(dex, holders)
-            v.breakdown["kol"]       = self._score_kol(kol_handle, mos)
-
+            v.breakdown.update(common)
+            v.breakdown["insiders"] = self._score_insiders(bundle, rug, mos)
+            v.breakdown["kol"]      = self._score_kol(kol_handle, mos)
             v.score = sum(v.breakdown.values())
-
-            for floor, size in TIERS:
-                if v.score >= floor:
-                    v.buy, v.size_sol = True, size
-                    break
+            v.size_sol = _tier_size(v.score)
+            v.buy = v.size_sol > 0
             return v
 
     # ---------- data sources ----------
@@ -306,6 +344,7 @@ class PowerAnalyzer:
                 "created_at": p.get("pairCreatedAt", 0),
                 "socials": (p.get("info") or {}).get("socials", []),
                 "pair_address": p.get("pairAddress", ""),
+                "price_usd": float(p.get("priceUsd") or 0) or None,
             }
         except Exception:
             return None
