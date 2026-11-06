@@ -26,7 +26,8 @@ hood_seen.json
 gt_ticks_*.jsonl
 ema_chart_*.html
 .DS_Store
-.claude/
+.claude/*
+!.claude/skills/
 Vibe-Trading/
 node_modules/
 
@@ -63,3 +64,6 @@ Vibe-Trading/
 
 # ── node deps for the extension's dev tests ──
 node_modules/
+
+# day-trader-skill runtime state (config, orders, plans)
+trader/
