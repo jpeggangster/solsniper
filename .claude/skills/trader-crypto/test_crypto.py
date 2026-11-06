@@ -64,6 +64,27 @@ class CryptoTest(unittest.TestCase):
             with self.assertRaises(crypto.CryptoError):
                 crypto.make_plan(doc, stop, "2R")
 
+    def test_aixbt(self):
+        self.assertTrue(crypto.is_risk("Binance to reopen NEAR withdrawals by end of next week"))
+        self.assertTrue(crypto.is_risk("team unlocks 703 million PENGU on November 21"))
+        self.assertFalse(crypto.is_risk("Binance re-enabled DOGE withdrawals across all supported networks"))
+        self.assertFalse(crypto.is_risk("Net deposits totaled $33B"))
+        raw = {"data": [{"symbol": "SOL", "rank": 15, "trend": 36.08, "rankBand": "strong",
+                         "intel": [{"headline": "Clients partnered with Solana"}]},
+                        {"symbol": "USDT", "rank": 3, "intel": []}]}
+        compact = {"HYPE": {"rank": 13, "intel": ["Led onchain protocols with $2.72M in revenue"]},
+                   "intel": [{"tickers": ["HYPE"], "headline": "Binance paused HYPE deposits"}]}
+        with tempfile.TemporaryDirectory() as d:
+            for name, doc in (("raw.json", raw), ("compact.json", compact)):
+                with open(os.path.join(d, name), "w") as fh:
+                    json.dump(doc, fh)
+            r = crypto.load_aixbt(os.path.join(d, "raw.json"))
+            self.assertEqual(sorted(r), ["SOL"])          # stablecoins dropped
+            self.assertEqual((r["SOL"]["rank"], r["SOL"]["trend"]), (15, 36.1))
+            c = crypto.load_aixbt(os.path.join(d, "compact.json"))
+            self.assertEqual(c["HYPE"]["risk"], ["Binance paused HYPE deposits"])
+            self.assertEqual(crypto.aixbt_universe(c), ["HYPE"])
+
     def test_cli_with_file(self):
         with tempfile.TemporaryDirectory() as d:
             f = os.path.join(d, "BTC.json")

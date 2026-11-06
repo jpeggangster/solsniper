@@ -31,6 +31,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
 import urllib.error
@@ -610,6 +611,78 @@ def size(plan, budget, max_loss, max_position_pct=50.0, unit_step=0.0001):
             "budget": budget, "max_loss": max_loss, "note": NOT_AN_ORDER}
 
 
+# ------------------------------------------------------------------ AIXBT context
+
+STABLES = {"USDT", "USDC", "USD1", "DAI", "USDE", "FDUSD", "TUSD", "PYUSD", "USDS"}
+RISK_WORDS = re.compile(r"\b(unlock\w*|hack\w*|exploit\w*|drain\w*|stolen|delist\w*|lawsuit|subpoena\w*|"
+                        r"nuked|depeg\w*|insolven\w*|security (flaw|findings|incident)|rug\w*)\b", re.I)
+ACCESS = re.compile(r"\b(withdraw\w*|deposit\w*|trading|swaps?)\b", re.I)
+BLOCKED = re.compile(r"\b(halt\w*|paus\w*|suspend\w*|disabl\w*|frozen|freez\w*|reopen\w*|restor\w*|closed)\b", re.I)
+
+
+def is_risk(headline):
+    h = headline or ""
+    return bool(RISK_WORDS.search(h) or (ACCESS.search(h) and BLOCKED.search(h)))
+
+
+def load_aixbt(path):
+    """AIXBT list_projects / get_project output, raw or compact -> {SYMBOL: context}.
+
+    Raw: {"data": [ {symbol, rank, trend, rankBand, intel:[{headline, grade, detectedAt}]} ]}
+    Compact: {"BTC": {"rank": 25, "trend": 6.8, "band": "strong", "intel": ["headline", ...]}}
+    Extra headlines from list_intel can sit in a top-level "intel" list of {ticker, headline, ...}."""
+    try:
+        doc = _unwrap(json.loads(_read(path)))
+    except (OSError, ValueError) as e:
+        raise CryptoError("could not read the AIXBT file %s: %s" % (path, e))
+    rows = doc.get("data") if isinstance(doc, dict) and "data" in doc else doc
+    if isinstance(rows, dict) and "symbol" in rows:
+        rows = [rows]
+    out = {}
+
+    def add(sym, ctx):
+        sym = (sym or "").upper()
+        if not sym or sym in STABLES:
+            return
+        cur = out.setdefault(sym, {"rank": None, "trend": None, "band": None, "intel": []})
+        for k in ("rank", "trend", "band"):
+            if ctx.get(k) is not None and (cur[k] is None or (k == "rank" and ctx[k] < cur[k])):
+                cur[k] = ctx[k]
+        for h in ctx.get("intel") or []:
+            if h and h not in cur["intel"]:
+                cur["intel"].append(h)
+
+    if isinstance(rows, list):
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            intel = [(i.get("headline") if isinstance(i, dict) else i) for i in (r.get("intel") or [])]
+            add(r.get("symbol") or r.get("ticker"),
+                {"rank": r.get("rank"), "trend": r.get("trend"), "band": r.get("rankBand") or r.get("band"),
+                 "intel": intel})
+    elif isinstance(rows, dict):
+        for sym, r in rows.items():
+            if sym == "intel" or not isinstance(r, dict):
+                continue
+            add(sym, {"rank": r.get("rank"), "trend": r.get("trend"), "band": r.get("band") or r.get("rankBand"),
+                      "intel": [(i.get("headline") if isinstance(i, dict) else i) for i in (r.get("intel") or [])]})
+    if isinstance(doc, dict) and isinstance(doc.get("intel"), list):
+        for i in doc["intel"]:
+            if isinstance(i, dict):
+                for t in (i.get("tickers") or [i.get("ticker") or i.get("symbol")]):
+                    add(t, {"intel": [i.get("headline")]})
+    for ctx in out.values():
+        ctx["risk"] = [h for h in ctx["intel"] if is_risk(h)]
+        if ctx["trend"] is not None:
+            ctx["trend"] = round(float(ctx["trend"]), 1)
+    return out
+
+
+def aixbt_universe(ctx, limit=25):
+    ranked = sorted((c["rank"] if c["rank"] is not None else 10 ** 6, s) for s, c in ctx.items())
+    return [s for _, s in ranked][:limit]
+
+
 # ------------------------------------------------------------------ scan
 
 def scan_one(base, bars, step, open_sec, now, or_min):
@@ -671,27 +744,56 @@ def read_json(path, what):
 def cmd_scan(a):
     now = parse_now(a.now)
     open_sec = parse_hm(a.session_open)
-    syms = [s for s in (a.symbols.split(",") if a.symbols else DEFAULT_UNIVERSE) if s.strip()]
+    ctx = load_aixbt(a.aixbt) if a.aixbt else {}
+    if a.symbols == "aixbt":
+        if not ctx:
+            raise CryptoError("--symbols aixbt needs --aixbt FILE")
+        syms = aixbt_universe(ctx, a.aixbt_top)
+    else:
+        syms = [s for s in (a.symbols.split(",") if a.symbols else DEFAULT_UNIVERSE) if s.strip()]
     rows, errs = [], []
     for s in syms:
         try:
             base, bars, _ = load(s, a.interval, a.days, a.bars, now if a.now else None)
-            rows.append(scan_one(base, bars, STEP[a.interval], open_sec, now, a.or_minutes))
+            row = scan_one(base, bars, STEP[a.interval], open_sec, now, a.or_minutes)
+            if ctx:
+                c = ctx.get(base) or {}
+                row["aixbt"] = {"rank": c.get("rank"), "trend": c.get("trend"), "band": c.get("band"),
+                                "intel": (c.get("intel") or [])[:3], "risk": c.get("risk") or []}
+            rows.append(row)
         except CryptoError as e:
             errs.append("%s: %s" % (base_of(s), e))
         if not a.bars:
             time.sleep(0.4)
-    rows.sort(key=lambda r: (-len(r["setups"]), -(r["volume_x_7d"] or 0)))
+    def rank_of(r):
+        x = (r.get("aixbt") or {}).get("rank")
+        return x if x is not None else 10 ** 6
+    rows.sort(key=lambda r: (-len(r["setups"]), rank_of(r), -(r["volume_x_7d"] or 0)))
     if a.json:
         print(json.dumps({"rows": rows, "errors": errs}, indent=2))
     else:
         print("Crypto scan, %s bars, session from %s UTC, as of %s" % (a.interval, a.session_open, fmt(now)))
-        print("%-6s %14s %8s %6s %6s  %s" % ("coin", "last", "24h %", "RSI", "vol x", "setups"))
+        ax = bool(ctx)
+        print("%-6s %14s %8s %6s %6s %s %s" % ("coin", "last", "24h %", "RSI", "vol x",
+                                              " aixbt" if ax else "", " setups"))
         for r in rows:
-            print("%-6s %14s %8s %6s %6s  %s" % (
+            c = r.get("aixbt") or {}
+            tag = ""
+            if ax:
+                tag = ("#%d" % c["rank"]) if c.get("rank") is not None else "-"
+                tag = "%6s" % (tag + ("!" if c.get("risk") else ""))
+            print("%-6s %14s %8s %6s %6s %s  %s" % (
                 r["symbol"], rp(r["last"]), "" if r["change_24h_pct"] is None else "%+.2f" % r["change_24h_pct"],
                 "" if r["daily_rsi"] is None else "%.0f" % r["daily_rsi"],
-                "" if r["volume_x_7d"] is None else "%.2f" % r["volume_x_7d"], ", ".join(r["setups"]) or "-"))
+                "" if r["volume_x_7d"] is None else "%.2f" % r["volume_x_7d"], tag, ", ".join(r["setups"]) or "-"))
+        flagged = [r for r in rows if (r.get("aixbt") or {}).get("risk")]
+        if flagged:
+            print("\nAIXBT event risk (! above). Read before trusting any setup:")
+            for r in flagged:
+                for h in r["aixbt"]["risk"][:3]:
+                    print("  %-6s %s" % (r["symbol"], h))
+        if ax:
+            print("AIXBT rank = attention trend (#1 = most). Context, not a signal.")
         for e in errs:
             print("  skipped " + e)
     if a.write:
@@ -719,6 +821,19 @@ def cmd_entry(a):
         print("  " + res["detail"])
         if res.get("trigger"):
             print("  entry %s at %s" % (rp(res["trigger"]["price"]), res["trigger"]["time"]))
+    if a.aixbt:
+        c = load_aixbt(a.aixbt).get(base)
+        res["aixbt"] = c
+        if not a.json:
+            if c:
+                print("  AIXBT: rank %s, trend %s%s" % (c.get("rank") or "-", c.get("trend") or "-",
+                                                      ", %s" % c["band"] if c.get("band") else ""))
+                for h in c["risk"][:3]:
+                    print("  ! event risk: %s" % h)
+                for h in [x for x in c["intel"] if x not in c["risk"]][:2]:
+                    print("  - %s" % h)
+            else:
+                print("  AIXBT: no context for %s in %s" % (base, a.aixbt))
     if a.write and res["status"] == "triggered":
         write_json(a.write, res)
         print("wrote %s" % a.write)
@@ -823,7 +938,9 @@ def main(argv=None):
 
     p = sub.add_parser("scan", help="setups across a list of coins")
     common(p, "1h")
-    p.add_argument("--symbols", help="comma list (default: top 20 by market cap)")
+    p.add_argument("--symbols", help='comma list (default: top 20 by market cap), or "aixbt" for the AIXBT ranking')
+    p.add_argument("--aixbt", metavar="FILE", help="saved AIXBT list_projects / get_project JSON (or compact)")
+    p.add_argument("--aixbt-top", type=int, default=25, help="with --symbols aixbt: how many ranked coins")
     p.add_argument("--days", type=int, default=30)
     p.add_argument("--or-minutes", type=int, default=60)
     p.add_argument("--write", nargs="?", const=os.path.join(OUT_DIR, "watchlist.json"))
@@ -836,6 +953,7 @@ def main(argv=None):
     p.add_argument("--or-minutes", type=int, default=60)
     p.add_argument("--level", type=float)
     p.add_argument("--min-volume-x", type=float)
+    p.add_argument("--aixbt", metavar="FILE", help="saved AIXBT context for this coin")
     p.add_argument("--entries-hours", type=float, default=12, help="no new entries this long after the open")
     p.add_argument("--write", nargs="?", const=os.path.join(OUT_DIR, "entry.json"))
     p.set_defaults(fn=cmd_entry)

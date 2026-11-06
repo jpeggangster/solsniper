@@ -10,7 +10,9 @@ description: >-
   every past session the rule fired, and sizes the position in fractional
   units to your budget and max loss. NEVER builds or places an order:
   trader-risk blocks crypto and trader-broker never sees this. Reads
-  TradingView MCP bars (via trader-tradingview), Yahoo or Coinbase. Use when
+  TradingView MCP bars (via trader-tradingview), Yahoo or Coinbase, and layers
+  in AIXBT context: attention-trend rank, recent intel, and event-risk flags
+  (unlocks, paused withdrawals, hacks, delistings). Use when
   the user says "scan crypto", "is BTC breaking out", "crypto setups", "plan a
   SOL trade", "where's my stop on ETH", "replay this crypto trade", "how much
   BTC should I buy", or names a coin (BTC, ETH, SOL, ...) with any trader-*
@@ -36,6 +38,9 @@ python3 "${CLAUDE_SKILL_DIR}/crypto.py" entry BTC --write                    # O
 python3 "${CLAUDE_SKILL_DIR}/crypto.py" plan --stop or-mid --target 2R --write   # -> plan.json
 python3 "${CLAUDE_SKILL_DIR}/crypto.py" replay --write                       # 10,000 sessions + history
 python3 "${CLAUDE_SKILL_DIR}/crypto.py" size --budget 2000 --max-loss 20     # units; not an order
+python3 "${CLAUDE_SKILL_DIR}/crypto.py" scan --bars trader/tv --aixbt trader/crypto/aixbt.json   # + AIXBT
+python3 "${CLAUDE_SKILL_DIR}/crypto.py" scan --bars trader/tv --symbols aixbt --aixbt trader/crypto/aixbt.json
+python3 "${CLAUDE_SKILL_DIR}/crypto.py" entry SOL --aixbt trader/crypto/aixbt.json
 ```
 
 ## Sessions
@@ -68,6 +73,38 @@ The opening range is the first `--or-minutes` (60 by default). Entries stop
 `replay` wants weeks of history at the plan's interval: 5000 5-minute bars is
 about 17 days, 5000 15-minute bars about 52 days. Use the same file for
 `entry` and `replay`.
+
+## AIXBT context
+
+When the AIXBT connector (`mcp__aixbt__*`) is available, add it to every scan:
+
+1. `list_projects(sort="rank", limit=50)` gives the attention ranking with
+   each project's latest intel headlines. For coins in the scan that are not
+   in the top 50, call `list_projects(tickers="ZEC,ONDO,...")`. For fresh
+   event news on the scan's hits, call `list_intel(tickers="...", limit=20)`.
+2. Save it as `trader/crypto/aixbt.json`. Either save the raw result
+   (`{"data": [...]}`), or, because raw project rows carry long descriptions,
+   a compact map in this shape:
+
+   ```json
+   {"SOL": {"rank": 15, "trend": 36.1, "band": "strong", "intel": ["headline", "headline"]},
+    "intel": [{"tickers": ["HYPE", "INJ"], "headline": "Binance pausing withdrawals ..."}]}
+   ```
+
+   Copy headlines verbatim. Skip stablecoins and projects with no token symbol.
+3. Pass `--aixbt trader/crypto/aixbt.json` to `scan` or `entry`. The scan
+   adds a rank column (`#1` = most attention) and marks event risk with `!`:
+   headlines about unlocks, hacks, exploits, delistings, lawsuits, depegs, or
+   deposits, withdrawals or trading being halted, paused or reopened. Those
+   headlines are printed under the table. `--symbols aixbt` scans the
+   AIXBT-ranked coins (top `--aixbt-top`, 25 by default) instead of the
+   default list.
+
+How to use it: AIXBT rank is attention, not direction. A setup on a coin
+with an event-risk flag (an exchange pausing withdrawals, a token unlock
+this week) deserves a warning in the reply, because the price can gap on the
+event. Keep AIXBT-derived statements informational, as AIXBT asks: report
+what the data shows and give no buy, sell or price-target calls.
 
 ## Reading the output
 
