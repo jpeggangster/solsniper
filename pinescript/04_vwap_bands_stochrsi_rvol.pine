@@ -1,0 +1,105 @@
+//@version=6
+strategy("VWAP + Stoch RSI + RVOL Strategy", shorttitle="VSR-S", overlay=true,
+     initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     commission_type=strategy.commission.percent, commission_value=0.05, slippage=1)
+
+vwapSource     = input.source(hlc3, "VWAP Source")
+bandMultiplier = input.float(2.0, "VWAP Band StdDev Multiplier", minval=0.1, step=0.1)
+
+rsiLength   = input.int(14, "RSI Length", minval=1)
+stochLength = input.int(14, "Stochastic Length", minval=1)
+smoothK     = input.int(3, "K Smoothing", minval=1)
+smoothD     = input.int(3, "D Smoothing", minval=1)
+stochLow    = input.float(20, "Stoch RSI oversold level")
+stochHigh   = input.float(80, "Stoch RSI overbought level")
+
+rvolLength    = input.int(20, "RVOL SMA Length", minval=1)
+rvolThreshold = input.float(1.5, "RVOL Threshold", minval=0.1, step=0.1)
+
+allowShort = input.bool(true, "Allow Short Trades", group="Exits")
+tpMode     = input.string("VWAP", "Take Profit target", options=["VWAP", "Opposite Band", "Fixed %"], group="Exits")
+tpPct      = input.float(1.5, "Take Profit % (Fixed % mode)", minval=0.1, step=0.1, group="Exits")
+useSL      = input.bool(true, "Use Stop Loss", group="Exits")
+slPct      = input.float(1.0, "Stop Loss %", minval=0.1, step=0.1, group="Exits")
+exitOnOpp  = input.bool(true, "Close on Opposite Signal", group="Exits")
+
+// SESSION VWAP AND STANDARD DEVIATION BANDS
+newSession = timeframe.change("D")
+
+var float cumulativeVolume             = 0.0
+var float cumulativePriceVolume        = 0.0
+var float cumulativePriceSquaredVolume = 0.0
+
+if newSession
+    cumulativeVolume             := 0.0
+    cumulativePriceVolume        := 0.0
+    cumulativePriceSquaredVolume := 0.0
+
+cumulativeVolume             += volume
+cumulativePriceVolume        += vwapSource * volume
+cumulativePriceSquaredVolume += vwapSource * vwapSource * volume
+
+sessionVWAP    = cumulativeVolume > 0 ? cumulativePriceVolume / cumulativeVolume : na
+variance       = cumulativeVolume > 0 ? (cumulativePriceSquaredVolume / cumulativeVolume) - (sessionVWAP * sessionVWAP) : na
+weightedStdDev = math.sqrt(math.max(variance, 0.0))
+
+upperVWAPBand = sessionVWAP + bandMultiplier * weightedStdDev
+lowerVWAPBand = sessionVWAP - bandMultiplier * weightedStdDev
+
+plot(sessionVWAP,   title="Session VWAP",    color=color.blue,  linewidth=2)
+plot(upperVWAPBand, title="Upper VWAP Band", color=color.red,   linewidth=1)
+plot(lowerVWAPBand, title="Lower VWAP Band", color=color.green, linewidth=1)
+
+// STOCHASTIC RSI
+rsiValue = ta.rsi(close, rsiLength)
+stochRSI = ta.stoch(rsiValue, rsiValue, rsiValue, stochLength)
+k = ta.sma(stochRSI, smoothK)
+d = ta.sma(k, smoothD)
+
+stochLong  = k < stochLow  and ta.crossover(k, d)
+stochShort = k > stochHigh and ta.crossunder(k, d)
+
+// RVOL
+averageVolume = ta.sma(volume, rvolLength)
+rvol     = averageVolume > 0 ? volume / averageVolume : na
+highRVOL = rvol > rvolThreshold
+
+touchLowerBand = low  <= lowerVWAPBand
+touchUpperBand = high >= upperVWAPBand
+greenCandle    = close > open
+redCandle      = close < open
+
+longSignal  = touchLowerBand and stochLong  and highRVOL and greenCandle
+shortSignal = touchUpperBand and stochShort and highRVOL and redCandle
+
+if longSignal and (strategy.position_size >= 0 or exitOnOpp)
+    strategy.entry("Long", strategy.long)
+
+if shortSignal
+    if allowShort and (strategy.position_size <= 0 or exitOnOpp)
+        strategy.entry("Short", strategy.short)
+    else if not allowShort and exitOnOpp and strategy.position_size > 0
+        strategy.close("Long", comment="Opp signal")
+
+avgPx = strategy.position_avg_price
+longTP  = tpMode == "VWAP" ? sessionVWAP : tpMode == "Opposite Band" ? upperVWAPBand : avgPx * (1 + tpPct / 100)
+shortTP = tpMode == "VWAP" ? sessionVWAP : tpMode == "Opposite Band" ? lowerVWAPBand : avgPx * (1 - tpPct / 100)
+longSL  = useSL ? avgPx * (1 - slPct / 100) : na
+shortSL = useSL ? avgPx * (1 + slPct / 100) : na
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", "Long", stop=longSL, limit=longTP)
+if strategy.position_size < 0
+    strategy.exit("Short Exit", "Short", stop=shortSL, limit=shortTP)
+
+plotshape(longSignal,  title="Long Signal",  style=shape.arrowup,   location=location.belowbar, color=color.green, size=size.small)
+plotshape(shortSignal, title="Short Signal", style=shape.arrowdown, location=location.abovebar, color=color.red,   size=size.small)
+
+if longSignal
+    alert("LONG on " + syminfo.ticker + ": lower VWAP band touch, Stoch RSI oversold cross up, high RVOL, green candle", alert.freq_once_per_bar_close)
+if shortSignal
+    alert("SHORT on " + syminfo.ticker + ": upper VWAP band touch, Stoch RSI overbought cross down, high RVOL, red candle", alert.freq_once_per_bar_close)
+
+plot(rvol, title="RVOL",              color=color.orange, display=display.data_window)
+plot(k,    title="Stochastic RSI %K", color=color.aqua,   display=display.data_window)
+plot(d,    title="Stochastic RSI %D", color=color.purple, display=display.data_window)

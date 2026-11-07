@@ -1,0 +1,95 @@
+//@version=6
+strategy("30m Signal System (Strategy)", overlay = false,
+     initial_capital = 1000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100,
+     commission_type = strategy.commission.percent, commission_value = 0.05)
+
+// ---------------- INPUTS ----------------
+atrLen     = input.int(10,    "Supertrend ATR length", minval = 1)
+factor     = input.float(3.0, "Supertrend factor",     minval = 0.1, step = 0.1)
+fishLen    = input.int(9,     "Fisher length",         minval = 1)
+fishLevel  = input.float(1.5, "Fisher extreme level",  minval = 0.1, step = 0.1)
+lookback   = input.int(10,    "Fisher lookback (candles)", minval = 1)
+kvoFast    = input.int(34,    "Klinger fast EMA")
+kvoSlow    = input.int(55,    "Klinger slow EMA")
+kvoSigLen  = input.int(13,    "Klinger signal EMA")
+allowLong  = input.bool(true, "Take longs")
+allowShort = input.bool(true, "Take shorts")
+
+// ---------------- 1) SUPERTREND ----------------
+[st, dir] = ta.supertrend(factor, atrLen)
+isUp   = dir < 0
+isDown = dir > 0
+
+plot(isUp   ? st : na, "Supertrend Up",   color = color.green, linewidth = 2, style = plot.style_linebr, force_overlay = true)
+plot(isDown ? st : na, "Supertrend Down", color = color.red,   linewidth = 2, style = plot.style_linebr, force_overlay = true)
+
+// ---------------- 2) FISHER TRANSFORM ----------------
+src  = hl2
+hi   = ta.highest(src, fishLen)
+lo   = ta.lowest(src, fishLen)
+rng  = hi - lo
+norm = rng > 0 ? (src - lo) / rng - 0.5 : 0.0
+
+float val = na
+val := 0.66 * norm + 0.67 * nz(val[1])
+val := math.max(math.min(val, 0.999), -0.999)
+
+float fish = na
+fish := 0.5 * math.log((1 + val) / (1 - val)) + 0.5 * nz(fish[1])
+trigger = nz(fish[1])
+
+// ---------------- 3) KLINGER OSCILLATOR ----------------
+int trend = hlc3 > nz(hlc3[1]) ? 1 : -1
+dm = high - low
+
+float cm = na
+cm := trend == nz(trend[1]) ? nz(cm[1]) + dm : nz(dm[1]) + dm
+
+vf   = cm == 0 ? 0.0 : volume * math.abs(2 * dm / cm - 1) * trend * 100
+kvo  = ta.ema(vf, kvoFast) - ta.ema(vf, kvoSlow)
+kSig = ta.ema(kvo, kvoSigLen)
+
+// ---------------- SIGNAL LOGIC ----------------
+fishCrossUp   = ta.crossover(fish, trigger)
+fishCrossDown = ta.crossunder(fish, trigger)
+fishWasLow    = ta.lowest(fish,  lookback) < -fishLevel
+fishWasHigh   = ta.highest(fish, lookback) >  fishLevel
+
+longSignal  = isUp   and fishWasLow  and fishCrossUp   and kvo > kSig
+shortSignal = isDown and fishWasHigh and fishCrossDown and kvo < kSig
+stFlip      = not na(dir[1]) and dir != dir[1]
+
+// ---------------- TRADES ----------------
+if strategy.position_size > 0 and isDown
+    strategy.close("Long", comment = "ST flip")
+if strategy.position_size < 0 and isUp
+    strategy.close("Short", comment = "ST flip")
+
+if longSignal and allowLong
+    strategy.entry("Long", strategy.long)
+if shortSignal and allowShort
+    strategy.entry("Short", strategy.short)
+
+// ---------------- PANE PLOTS ----------------
+kScale = ta.highest(math.abs(kvo), 200)
+kvoD   = kScale > 0 ? kvo  / kScale * 3 : 0.0
+kSigD  = kScale > 0 ? kSig / kScale * 3 : 0.0
+
+plot(fish,    "Fisher",                  color = color.blue,   linewidth = 2)
+plot(trigger, "Fisher Trigger",          color = color.orange, linewidth = 1)
+plot(kvoD,    "Klinger (scaled)",        color = color.teal,   linewidth = 1, style = plot.style_stepline)
+plot(kSigD,   "Klinger Signal (scaled)", color = color.purple, linewidth = 1, style = plot.style_stepline)
+hline( fishLevel, "Fisher +level", color = color.red,   linestyle = hline.style_dashed)
+hline(-fishLevel, "Fisher -level", color = color.green, linestyle = hline.style_dashed)
+hline(0,          "Zero",          color = color.gray,  linestyle = hline.style_dotted)
+
+plotshape(longSignal,  "Long",  shape.arrowup,   location.belowbar, color.green, size = size.normal, force_overlay = true)
+plotshape(shortSignal, "Short", shape.arrowdown, location.abovebar, color.red,   size = size.normal, force_overlay = true)
+
+// ---------------- ALERTS ----------------
+if longSignal
+    alert("LONG signal on " + syminfo.ticker + " " + timeframe.period, alert.freq_once_per_bar_close)
+if shortSignal
+    alert("SHORT signal on " + syminfo.ticker + " " + timeframe.period, alert.freq_once_per_bar_close)
+if stFlip
+    alert("Supertrend flipped on " + syminfo.ticker + " " + timeframe.period + " - EXIT", alert.freq_once_per_bar_close)

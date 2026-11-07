@@ -1,0 +1,98 @@
+//@version=6
+strategy("10m Breakout Strategy", shorttitle="10mBreakS", overlay=false,
+     initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     commission_type=strategy.commission.percent, commission_value=0.05, slippage=1)
+
+// INPUTS
+aroonLen   = input.int(25, "Aroon Length", minval=1)
+vortexLen  = input.int(14, "Vortex Length", minval=1)
+volShort   = input.int(5, "Volume Osc Short Length", minval=1)
+volLong    = input.int(10, "Volume Osc Long Length", minval=1)
+upperLevel = input.int(70, "Aroon Strong Level (above)")
+lowerLevel = input.int(30, "Aroon Weak Level (below)")
+volLevel   = input.float(10.0, "Volume Osc Minimum (%)")
+crossBars  = input.int(3, "Vortex Cross Lookback (candles)", minval=1)
+only10m    = input.bool(true, "Only signal on 10 minute chart")
+showVortex = input.bool(true, "Show Vortex in panel (scaled x50)")
+showVolOsc = input.bool(true, "Show Volume Oscillator in panel")
+
+allowShort = input.bool(true, "Allow Short Trades", group="Exits")
+useSLTP    = input.bool(true, "Use Stop Loss / Take Profit", group="Exits")
+slPct      = input.float(1.0, "Stop Loss %", minval=0.1, step=0.1, group="Exits")
+tpPct      = input.float(2.0, "Take Profit %", minval=0.1, step=0.1, group="Exits")
+exitOnOpp  = input.bool(true, "Close on Opposite Signal", group="Exits")
+
+// AROON
+aroonUp   = 100 * (ta.highestbars(high, aroonLen + 1) + aroonLen) / aroonLen
+aroonDown = 100 * (ta.lowestbars(low, aroonLen + 1) + aroonLen) / aroonLen
+
+// VORTEX
+vmPlus  = math.abs(high - low[1])
+vmMinus = math.abs(low - high[1])
+trSum   = math.sum(ta.tr(true), vortexLen)
+viPlus  = math.sum(vmPlus, vortexLen) / trSum
+viMinus = math.sum(vmMinus, vortexLen) / trSum
+
+// VOLUME OSCILLATOR (%)
+volOsc = 100 * (ta.ema(volume, volShort) - ta.ema(volume, volLong)) / ta.ema(volume, volLong)
+
+// CROSS EVENTS
+aroonUpCross   = ta.crossover(aroonUp, upperLevel)
+aroonDownCross = ta.crossover(aroonDown, upperLevel)
+viBullCross    = ta.crossover(viPlus, viMinus)
+viBearCross    = ta.crossover(viMinus, viPlus)
+recentBull     = ta.barssince(viBullCross) < crossBars
+recentBear     = ta.barssince(viBearCross) < crossBars
+
+tfOK = not only10m or timeframe.in_seconds() == 600
+
+// ENTRY RULES
+longSignal  = tfOK and aroonUpCross and aroonDown < lowerLevel and viPlus > viMinus and recentBull and volOsc > volLevel
+shortSignal = tfOK and aroonDownCross and aroonUp < lowerLevel and viMinus > viPlus and recentBear and volOsc > volLevel
+
+// ORDERS
+if longSignal
+    if strategy.position_size < 0 and not exitOnOpp
+        na
+    else
+        strategy.entry("Long", strategy.long)
+
+if shortSignal
+    if strategy.position_size > 0 and not exitOnOpp
+        na
+    else if allowShort
+        strategy.entry("Short", strategy.short)
+    else if strategy.position_size > 0
+        strategy.close("Long", comment="Opp signal")
+
+if useSLTP
+    if strategy.position_size > 0
+        strategy.exit("Long Exit", "Long",
+             stop  = strategy.position_avg_price * (1 - slPct / 100),
+             limit = strategy.position_avg_price * (1 + tpPct / 100))
+    if strategy.position_size < 0
+        strategy.exit("Short Exit", "Short",
+             stop  = strategy.position_avg_price * (1 + slPct / 100),
+             limit = strategy.position_avg_price * (1 - tpPct / 100))
+
+// PANEL PLOTS
+plot(aroonUp, "Aroon Up", color=color.green, linewidth=2)
+plot(aroonDown, "Aroon Down", color=color.red, linewidth=2)
+hline(upperLevel, "Aroon Strong", color=color.gray, linestyle=hline.style_dashed)
+hline(lowerLevel, "Aroon Weak", color=color.gray, linestyle=hline.style_dashed)
+
+plot(showVortex ? viPlus * 50 : na, "VI Plus x50", color=color.lime)
+plot(showVortex ? viMinus * 50 : na, "VI Minus x50", color=color.maroon)
+
+plot(showVolOsc ? volOsc : na, "Volume Osc %", color=color.new(color.blue, 40), style=plot.style_columns)
+hline(0, "Vol Osc Zero", color=color.gray)
+hline(volLevel, "Vol Osc Min", color=color.orange, linestyle=hline.style_dashed)
+
+plotshape(longSignal, title="Long Signal", style=shape.arrowup, location=location.belowbar, color=color.green, size=size.normal, force_overlay=true)
+plotshape(shortSignal, title="Short Signal", style=shape.arrowdown, location=location.abovebar, color=color.red, size=size.normal, force_overlay=true)
+
+// ALERTS
+if longSignal
+    alert("LONG signal on " + syminfo.ticker + " (10m): Aroon + Vortex + Volume confirmed", alert.freq_once_per_bar_close)
+if shortSignal
+    alert("SHORT signal on " + syminfo.ticker + " (10m): Aroon + Vortex + Volume confirmed", alert.freq_once_per_bar_close)

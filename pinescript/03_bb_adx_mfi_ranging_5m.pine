@@ -1,0 +1,73 @@
+//@version=6
+// Ranging Market Signals (5-minute) - STRATEGY
+// Bollinger Bands + ADX + Money Flow Index.
+strategy("Ranging Market Signals Strategy", shorttitle="RMS-S", overlay=false,
+     initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     commission_type=strategy.commission.percent, commission_value=0.05, slippage=1)
+
+bbLength  = input.int(20,    "BB Length",       minval=1)
+bbMult    = input.float(2.0, "BB StdDev Mult",  minval=0.1, step=0.1)
+diLength  = input.int(14,    "ADX DI Length",   minval=1)
+adxSmooth = input.int(14,    "ADX Smoothing",   minval=1)
+mfiLength = input.int(14,    "MFI Length",      minval=1)
+adxMax    = input.float(20,  "Max ADX for signal (ranging filter)")
+mfiLow    = input.float(20,  "MFI oversold level")
+mfiHigh   = input.float(80,  "MFI overbought level")
+
+allowShort = input.bool(true, "Allow Short Trades", group="Exits")
+tpMode     = input.string("BB Basis", "Take Profit target", options=["BB Basis", "Opposite Band", "Fixed %"], group="Exits")
+tpPct      = input.float(1.5, "Take Profit % (Fixed % mode)", minval=0.1, step=0.1, group="Exits")
+useSL      = input.bool(true, "Use Stop Loss", group="Exits")
+slPct      = input.float(1.0, "Stop Loss %", minval=0.1, step=0.1, group="Exits")
+exitOnOpp  = input.bool(true, "Close on Opposite Signal", group="Exits")
+
+[basis, upper, lower] = ta.bb(close, bbLength, bbMult)
+plot(upper, "BB Upper", color=color.purple, force_overlay=true)
+plot(lower, "BB Lower", color=color.purple, force_overlay=true)
+plot(basis, "BB Basis", color=color.white,  force_overlay=true)
+
+[diPlus, diMinus, adx] = ta.dmi(diLength, adxSmooth)
+plot(adx, "ADX", color=color.orange, linewidth=2)
+hline(adxMax, "ADX Max", color=color.gray, linestyle=hline.style_dashed)
+
+mfi = ta.mfi(hlc3, mfiLength)
+plot(mfi, "MFI", color=color.aqua, linewidth=2)
+hline(mfiLow,  "MFI Oversold",   color=color.green, linestyle=hline.style_dashed)
+hline(mfiHigh, "MFI Overbought", color=color.red,   linestyle=hline.style_dashed)
+
+isRanging  = adx < adxMax
+mfiRising  = mfi > mfi[1]
+mfiFalling = mfi < mfi[1]
+
+longSignal  = close[1] < lower[1] and close > lower and isRanging and mfi[1] < mfiLow and mfiRising
+shortSignal = close[1] > upper[1] and close < upper and isRanging and mfi[1] > mfiHigh and mfiFalling
+
+if longSignal and (strategy.position_size >= 0 or exitOnOpp)
+    strategy.entry("Long", strategy.long)
+
+if shortSignal
+    if allowShort and (strategy.position_size <= 0 or exitOnOpp)
+        strategy.entry("Short", strategy.short)
+    else if not allowShort and exitOnOpp and strategy.position_size > 0
+        strategy.close("Long", comment="Opp signal")
+
+avgPx = strategy.position_avg_price
+longTP  = tpMode == "BB Basis" ? basis : tpMode == "Opposite Band" ? upper : avgPx * (1 + tpPct / 100)
+shortTP = tpMode == "BB Basis" ? basis : tpMode == "Opposite Band" ? lower : avgPx * (1 - tpPct / 100)
+longSL  = useSL ? avgPx * (1 - slPct / 100) : na
+shortSL = useSL ? avgPx * (1 + slPct / 100) : na
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", "Long", stop=longSL, limit=longTP)
+if strategy.position_size < 0
+    strategy.exit("Short Exit", "Short", stop=shortSL, limit=shortTP)
+
+plotshape(longSignal,  "Long Signal",  style=shape.arrowup,   location=location.belowbar,
+     color=color.green, size=size.normal, force_overlay=true)
+plotshape(shortSignal, "Short Signal", style=shape.arrowdown, location=location.abovebar,
+     color=color.red,   size=size.normal, force_overlay=true)
+
+if longSignal
+    alert("RMS: LONG on " + syminfo.ticker + " - price reclaimed lower BB in ranging market", alert.freq_once_per_bar_close)
+if shortSignal
+    alert("RMS: SHORT on " + syminfo.ticker + " - price rejected upper BB in ranging market", alert.freq_once_per_bar_close)

@@ -1,0 +1,93 @@
+//@version=6
+// Range-Bound Mean-Reversion Strategy — Bollinger Bands + ADX + RSI
+strategy(title                   = "BB + ADX + RSI Range Strategy",
+         shorttitle              = "BB-ADX-RSI Range",
+         overlay                 = true,
+         initial_capital         = 10000,
+         default_qty_type        = strategy.percent_of_equity,
+         default_qty_value       = 100,
+         commission_type         = strategy.commission.percent,
+         commission_value        = 0.04,
+         pyramiding              = 0,
+         calc_on_every_tick      = false,
+         process_orders_on_close = true)
+
+bbLength = input.int(20,       "BB Length",             minval = 1,               group = "Bollinger Bands")
+bbMult   = input.float(2.0,    "BB Std-Dev Multiplier", minval = 0.1, step = 0.1, group = "Bollinger Bands")
+bbSource = input.source(close, "BB Source",                                       group = "Bollinger Bands")
+
+adxDiLength  = input.int(14,     "ADX DI Length", minval = 1, group = "ADX Filter")
+adxSmoothing = input.int(14,     "ADX Smoothing", minval = 1, group = "ADX Filter")
+adxThreshold = input.float(22.0, "ADX Threshold  (only trade when ADX is BELOW this)", minval = 1, step = 0.5, group = "ADX Filter")
+
+rsiLength     = input.int(14,     "RSI Length", minval = 1, group = "RSI Filter")
+rsiOversold   = input.float(30.0, "RSI Oversold  (long entry requires RSI BELOW this)",  minval = 1, maxval = 99, step = 1, group = "RSI Filter")
+rsiOverbought = input.float(70.0, "RSI Overbought (short entry requires RSI ABOVE this)", minval = 1, maxval = 99, step = 1, group = "RSI Filter")
+rsiExitLevel  = input.float(50.0, "RSI Mean-Reversion Exit Level",                        minval = 1, maxval = 99, step = 1, group = "RSI Filter")
+
+useMidBandExit = input.bool(true, "Exit when price reaches the BB basis (middle band)",       group = "Exits")
+useRsiExit     = input.bool(true, "Exit when RSI crosses back through the exit level (50)",    group = "Exits")
+useTakeProfit  = input.bool(true, "Also use a fixed Risk:Reward TP / SL bracket (alt. exit)", group = "Exits")
+stopLossPerc   = input.float(2.0, "Stop-Loss distance (% of entry price)",   minval = 0.1, step = 0.1, group = "Exits")
+riskReward     = input.float(1.5, "Reward : Risk ratio for the take-profit", minval = 0.1, step = 0.1, group = "Exits")
+
+allowLongs  = input.bool(true, "Allow Long trades",  group = "Direction")
+allowShorts = input.bool(true, "Allow Short trades", group = "Direction")
+
+bbBasis = ta.sma(bbSource, bbLength)
+bbDev   = bbMult * ta.stdev(bbSource, bbLength)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+
+[diPlus, diMinus, adxValue] = ta.dmi(adxDiLength, adxSmoothing)
+rsiValue = ta.rsi(close, rsiLength)
+
+pUpper = plot(bbUpper, "BB Upper", color = color.new(color.blue,   0))
+pBasis = plot(bbBasis, "BB Basis", color = color.new(color.orange, 0))
+pLower = plot(bbLower, "BB Lower", color = color.new(color.blue,   0))
+fill(pUpper, pLower, color = color.new(color.blue, 92), title = "BB Background")
+
+plot(adxValue, "ADX", display = display.data_window)
+plot(rsiValue, "RSI", display = display.data_window)
+plot(diPlus,   "+DI", display = display.data_window)
+plot(diMinus,  "-DI", display = display.data_window)
+
+isRanging = adxValue < adxThreshold
+
+longSignal  = allowLongs  and isRanging and close <= bbLower and rsiValue < rsiOversold
+shortSignal = allowShorts and isRanging and close >= bbUpper and rsiValue > rsiOverbought
+
+if longSignal
+    strategy.entry("Long", strategy.long)
+if shortSignal
+    strategy.entry("Short", strategy.short)
+
+longMidHit  = useMidBandExit and close >= bbBasis
+shortMidHit = useMidBandExit and close <= bbBasis
+longRsiHit  = useRsiExit and ta.crossover(rsiValue,  rsiExitLevel)
+shortRsiHit = useRsiExit and ta.crossunder(rsiValue, rsiExitLevel)
+
+if strategy.position_size > 0 and (longMidHit or longRsiHit)
+    strategy.close("Long", comment = "Exit Long: basis / RSI")
+if strategy.position_size < 0 and (shortMidHit or shortRsiHit)
+    strategy.close("Short", comment = "Exit Short: basis / RSI")
+
+if useTakeProfit
+    longStopPrice  = strategy.position_avg_price * (1 - stopLossPerc / 100)
+    longTpPrice    = strategy.position_avg_price * (1 + (stopLossPerc * riskReward) / 100)
+    shortStopPrice = strategy.position_avg_price * (1 + stopLossPerc / 100)
+    shortTpPrice   = strategy.position_avg_price * (1 - (stopLossPerc * riskReward) / 100)
+    if strategy.position_size > 0
+        strategy.exit("RR Long",  from_entry = "Long",  stop = longStopPrice,  limit = longTpPrice,  comment = "RR exit Long")
+    if strategy.position_size < 0
+        strategy.exit("RR Short", from_entry = "Short", stop = shortStopPrice, limit = shortTpPrice, comment = "RR exit Short")
+
+plotshape(longSignal,  title = "Long Entry Marker",  style = shape.triangleup,
+     location = location.belowbar, color = color.new(color.green, 0), size = size.small, text = "LONG")
+plotshape(shortSignal, title = "Short Entry Marker", style = shape.triangledown,
+     location = location.abovebar, color = color.new(color.red, 0),   size = size.small, text = "SHORT")
+
+if longSignal
+    alert("LONG signal on " + syminfo.ticker + " (" + timeframe.period + "): close <= lower BB, ADX < threshold, RSI oversold. Price " + str.tostring(close), alert.freq_once_per_bar_close)
+if shortSignal
+    alert("SHORT signal on " + syminfo.ticker + " (" + timeframe.period + "): close >= upper BB, ADX < threshold, RSI overbought. Price " + str.tostring(close), alert.freq_once_per_bar_close)

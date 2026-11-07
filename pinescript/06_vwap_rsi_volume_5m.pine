@@ -1,0 +1,87 @@
+//@version=6
+strategy("VWAP + RSI + Volume Strategy (5m)", shorttitle="VRV-S", overlay=false,
+     initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     commission_type=strategy.commission.percent, commission_value=0.05, slippage=1)
+
+vwapSrc    = input.source(hlc3, "VWAP Source", group="VWAP")
+vwapAnchor = input.timeframe("D", "VWAP Anchor (session reset)", group="VWAP")
+
+rsiLen     = input.int(14, "RSI Length", minval=1, group="RSI")
+rsiOB      = input.float(70, "RSI Overbought", group="RSI")
+rsiOS      = input.float(30, "RSI Oversold", group="RSI")
+rsiLook    = input.int(5, "RSI extreme lookback (candles)", minval=1, group="RSI")
+
+volMaLen   = input.int(30, "Volume MA Length", minval=1, group="Volume")
+
+allowShort = input.bool(true,  "Allow Short Trades", group="Exits")
+useSL      = input.bool(true,  "Use Stop Loss", group="Exits")
+slPct      = input.float(0.5,  "Stop Loss %", minval=0.05, step=0.05, group="Exits")
+useTP      = input.bool(true,  "Use Take Profit", group="Exits")
+tpPct      = input.float(1.0,  "Take Profit %", minval=0.05, step=0.05, group="Exits")
+exitVwap   = input.bool(true,  "Exit when price closes back through VWAP", group="Exits")
+exitOnOpp  = input.bool(true,  "Close on Opposite Signal", group="Exits")
+
+newAnchor = timeframe.change(vwapAnchor)
+vwapVal   = ta.vwap(vwapSrc, newAnchor)
+plot(vwapVal, "VWAP", color=color.blue, linewidth=2, force_overlay=true)
+
+rsi   = ta.rsi(close, rsiLen)
+volMa = ta.sma(volume, volMaLen)
+
+greenCandle = close > open
+redCandle   = close < open
+highVol     = volume > volMa
+
+vwapReclaim = ta.crossover(close, vwapVal)
+vwapReject  = ta.crossunder(close, vwapVal)
+
+rsiOutOfOS  = ta.lowest(rsi, rsiLook)  < rsiOS and rsi > rsi[1]
+rsiOutOfOB  = ta.highest(rsi, rsiLook) > rsiOB and rsi < rsi[1]
+
+longSignal  = vwapReclaim and rsiOutOfOS and highVol and greenCandle
+shortSignal = vwapReject  and rsiOutOfOB and highVol and redCandle
+
+if longSignal and (strategy.position_size >= 0 or exitOnOpp)
+    strategy.entry("Long", strategy.long)
+
+if shortSignal
+    if allowShort and (strategy.position_size <= 0 or exitOnOpp)
+        strategy.entry("Short", strategy.short)
+    else if not allowShort and exitOnOpp and strategy.position_size > 0
+        strategy.close("Long", comment="Opp signal")
+
+if exitVwap
+    if strategy.position_size > 0 and close < vwapVal
+        strategy.close("Long", comment="Below VWAP")
+    if strategy.position_size < 0 and close > vwapVal
+        strategy.close("Short", comment="Above VWAP")
+
+avgPx   = strategy.position_avg_price
+longSL  = useSL ? avgPx * (1 - slPct / 100) : na
+shortSL = useSL ? avgPx * (1 + slPct / 100) : na
+longTP  = useTP ? avgPx * (1 + tpPct / 100) : na
+shortTP = useTP ? avgPx * (1 - tpPct / 100) : na
+
+if (useSL or useTP) and strategy.position_size > 0
+    strategy.exit("Long Exit", "Long", stop=longSL, limit=longTP)
+if (useSL or useTP) and strategy.position_size < 0
+    strategy.exit("Short Exit", "Short", stop=shortSL, limit=shortTP)
+
+plot(rsi, "RSI", color=color.purple, linewidth=2)
+hline(rsiOB, "Overbought", color=color.red,   linestyle=hline.style_dashed)
+hline(rsiOS, "Oversold",   color=color.green, linestyle=hline.style_dashed)
+hline(50,    "Mid",        color=color.gray,  linestyle=hline.style_dotted)
+
+volScale = ta.highest(volume, 100)
+volD     = volScale > 0 ? volume / volScale * 25 : 0.0
+volMaD   = volScale > 0 ? volMa  / volScale * 25 : 0.0
+plot(volD,   "Volume (scaled)",    color=greenCandle ? color.new(color.green, 50) : color.new(color.red, 50), style=plot.style_columns)
+plot(volMaD, "Volume MA (scaled)", color=color.white, linewidth=1)
+
+plotshape(longSignal,  "Long",  shape.arrowup,   location.belowbar, color.green, size=size.normal, force_overlay=true)
+plotshape(shortSignal, "Short", shape.arrowdown, location.abovebar, color.red,   size=size.normal, force_overlay=true)
+
+if longSignal
+    alert("LONG on " + syminfo.ticker + " @ " + str.tostring(close) + ": VWAP reclaim, RSI out of oversold, volume > MA, green candle", alert.freq_once_per_bar_close)
+if shortSignal
+    alert("SHORT on " + syminfo.ticker + " @ " + str.tostring(close) + ": VWAP reject, RSI out of overbought, volume > MA, red candle", alert.freq_once_per_bar_close)

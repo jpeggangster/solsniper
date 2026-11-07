@@ -1,0 +1,97 @@
+//@version=6
+strategy("BB + RSI Divergence Strategy", shorttitle="BB-RSI Div", overlay=true,
+     initial_capital=10000,
+     commission_type=strategy.commission.percent, commission_value=0.1,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100)
+
+bbLength  = input.int(30,    "BB Length",            minval=1)
+bbMult    = input.float(2.0, "BB Std Dev",           minval=0.1, step=0.1)
+rsiLength = input.int(14,    "RSI Length",           minval=1)
+rsiOB     = input.int(70,    "RSI Overbought Level", minval=50, maxval=100)
+rsiOS     = input.int(30,    "RSI Oversold Level",   minval=0,  maxval=50)
+lookback  = input.int(5,     "Divergence Lookback (bars)", minval=2)
+
+onlyHC    = input.bool(false, "Only trade High-Confidence (divergence) signals", group="Trading")
+allowShort= input.bool(true,  "Allow Short trades",                              group="Trading")
+useSL     = input.bool(false, "Use Stop Loss",                                   group="Trading")
+slPct     = input.float(3.0,  "Stop Loss %", minval=0.1, step=0.1,               group="Trading")
+
+// ta.bb() returns [middle, upper, lower]
+[bbMiddle, bbUpper, bbLower] = ta.bb(close, bbLength, bbMult)
+rsi   = ta.rsi(close, rsiLength)
+bbStd = ta.stdev(close, bbLength)
+
+p1 = plot(bbUpper,  "BB Upper",  color=color.new(color.blue, 70), linewidth=1)
+p2 = plot(bbLower,  "BB Lower",  color=color.new(color.blue, 70), linewidth=1)
+plot(bbMiddle,      "BB Middle", color=color.new(color.blue, 40), linewidth=1)
+fill(p1, p2, color=color.new(color.blue, 92), title="BB Fill")
+
+prevPriceLow  = ta.lowest(low,  lookback)[1]
+prevRsiLow    = ta.lowest(rsi,  lookback)[1]
+bullDiv = low < prevPriceLow and rsi > prevRsiLow
+
+prevPriceHigh = ta.highest(high, lookback)[1]
+prevRsiHigh   = ta.highest(rsi,  lookback)[1]
+bearDiv = high > prevPriceHigh and rsi < prevRsiHigh
+
+longBase    = close < bbLower and rsi <= rsiOS
+longHiConf  = longBase and bullDiv
+longStd     = longBase and not bullDiv
+longEntry   = onlyHC ? longHiConf : longBase
+
+shortBase   = close > bbUpper and rsi >= rsiOB
+shortHiConf = shortBase and bearDiv
+shortStd    = shortBase and not bearDiv
+shortEntry  = allowShort and (onlyHC ? shortHiConf : shortBase)
+
+exitLong  = ta.crossover(close,  bbMiddle)
+exitShort = ta.crossunder(close, bbMiddle)
+
+if longEntry
+    strategy.entry("Long", strategy.long)
+if shortEntry
+    strategy.entry("Short", strategy.short)
+if exitLong and strategy.position_size > 0
+    strategy.close("Long", comment="Mid-band exit")
+if exitShort and strategy.position_size < 0
+    strategy.close("Short", comment="Mid-band exit")
+
+if useSL and strategy.position_size > 0
+    strategy.exit("Long SL", "Long", stop=strategy.position_avg_price * (1 - slPct / 100))
+if useSL and strategy.position_size < 0
+    strategy.exit("Short SL", "Short", stop=strategy.position_avg_price * (1 + slPct / 100))
+
+plotshape(longHiConf,  title="Long High-Conf",  style=shape.triangleup,   location=location.belowbar,
+     color=color.lime,   size=size.normal, text="HC LONG")
+plotshape(longStd,     title="Long Std",        style=shape.triangleup,   location=location.belowbar,
+     color=color.green,  size=size.small,  text="LONG")
+plotshape(shortHiConf, title="Short High-Conf", style=shape.triangledown, location=location.abovebar,
+     color=color.red,    size=size.normal, text="HC SHORT")
+plotshape(shortStd,    title="Short Std",       style=shape.triangledown, location=location.abovebar,
+     color=color.maroon, size=size.small,  text="SHORT")
+
+var label sigLabel = na
+if longHiConf or longStd or shortHiConf or shortStd
+    labelTxt = longHiConf  ? "HIGH-CONF LONG (Bullish Div)" :
+               longStd     ? "Standard LONG" :
+               shortHiConf ? "HIGH-CONF SHORT (Bearish Div)" :
+               "Standard SHORT"
+    isLong     = longHiConf or longStd
+    labelColor = isLong ? color.new(color.green, 20) : color.new(color.red, 20)
+    labelY     = isLong ? bbLower - bbStd : bbUpper + bbStd
+    label.delete(sigLabel)
+    sigLabel := label.new(bar_index, labelY, text=labelTxt, color=labelColor, textcolor=color.white,
+         style=label.style_label_center, size=size.normal)
+
+if longHiConf
+    alert("HIGH-CONFIDENCE LONG on " + syminfo.ticker + " - Bullish divergence + BB lower band + RSI oversold", alert.freq_once_per_bar_close)
+if longStd
+    alert("STANDARD LONG on " + syminfo.ticker + " - Price below BB lower band + RSI oversold", alert.freq_once_per_bar_close)
+if shortHiConf
+    alert("HIGH-CONFIDENCE SHORT on " + syminfo.ticker + " - Bearish divergence + BB upper band + RSI overbought", alert.freq_once_per_bar_close)
+if shortStd
+    alert("STANDARD SHORT on " + syminfo.ticker + " - Price above BB upper band + RSI overbought", alert.freq_once_per_bar_close)
+if exitLong and strategy.position_size > 0
+    alert("EXIT LONG on " + syminfo.ticker + " - Price crossed above BB middle band", alert.freq_once_per_bar_close)
+if exitShort and strategy.position_size < 0
+    alert("EXIT SHORT on " + syminfo.ticker + " - Price crossed below BB middle band", alert.freq_once_per_bar_close)

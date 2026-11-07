@@ -1,0 +1,76 @@
+//@version=6
+strategy("3-Min Scalping Strategy [KC + CMO + RVOL]", shorttitle="Scalp-S", overlay=true,
+     initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     commission_type=strategy.commission.percent, commission_value=0.05, slippage=1)
+
+kcLength      = input.int(20,    "Keltner Length",        group="Keltner Channels", minval=1)
+kcMult        = input.float(1.5, "Keltner Multiplier",    group="Keltner Channels", minval=0.1, step=0.1)
+cmoPeriod     = input.int(14,    "CMO Period",            group="Chande Momentum Oscillator", minval=1)
+rvolLength    = input.int(20,    "RVOL Average Length",   group="Relative Volume (RVOL)", minval=1)
+rvolThreshold = input.float(1.5, "RVOL Signal Threshold", group="Relative Volume (RVOL)", minval=0.1, step=0.1)
+
+allowShort = input.bool(true, "Allow Short Trades", group="Exits")
+slMode     = input.string("ATR", "Stop Loss type", options=["ATR", "KC Middle", "Fixed %"], group="Exits")
+slAtrMult  = input.float(1.0, "Stop Loss (x ATR)",   minval=0.1, step=0.1, group="Exits")
+slPct      = input.float(0.5, "Stop Loss %",         minval=0.05, step=0.05, group="Exits")
+tpMode     = input.string("ATR", "Take Profit type", options=["ATR", "Fixed %", "None"], group="Exits")
+tpAtrMult  = input.float(2.0, "Take Profit (x ATR)", minval=0.1, step=0.1, group="Exits")
+tpPct      = input.float(1.0, "Take Profit %",       minval=0.05, step=0.05, group="Exits")
+exitOnOpp  = input.bool(true, "Close on Opposite Signal", group="Exits")
+
+kcMiddle = ta.ema(close, kcLength)
+kcAtr    = ta.atr(kcLength)
+kcUpper  = kcMiddle + kcAtr * kcMult
+kcLower  = kcMiddle - kcAtr * kcMult
+
+mom     = ta.change(close)
+gain    = mom > 0 ? mom : 0.0
+loss    = mom < 0 ? -mom : 0.0
+sumGain = math.sum(gain, cmoPeriod)
+sumLoss = math.sum(loss, cmoPeriod)
+cmo     = sumGain + sumLoss > 0 ? 100 * (sumGain - sumLoss) / (sumGain + sumLoss) : 0.0
+
+volSma = ta.sma(volume, rvolLength)
+rvol   = volSma > 0 ? volume / volSma : 0.0
+
+isGreenCandle = close > open
+isRedCandle   = close < open
+
+longCondition  = close > kcUpper and cmo > 0 and rvol > rvolThreshold and isGreenCandle
+shortCondition = close < kcLower and cmo < 0 and rvol > rvolThreshold and isRedCandle
+
+var float entryAtr = na
+
+if longCondition and strategy.position_size <= 0 and (strategy.position_size == 0 or exitOnOpp)
+    entryAtr := kcAtr
+    strategy.entry("Long", strategy.long)
+
+if shortCondition and strategy.position_size >= 0
+    if allowShort and (strategy.position_size == 0 or exitOnOpp)
+        entryAtr := kcAtr
+        strategy.entry("Short", strategy.short)
+    else if not allowShort and exitOnOpp and strategy.position_size > 0
+        strategy.close("Long", comment="Opp signal")
+
+avgPx = strategy.position_avg_price
+longSL  = slMode == "ATR" ? avgPx - entryAtr * slAtrMult : slMode == "KC Middle" ? kcMiddle : avgPx * (1 - slPct / 100)
+shortSL = slMode == "ATR" ? avgPx + entryAtr * slAtrMult : slMode == "KC Middle" ? kcMiddle : avgPx * (1 + slPct / 100)
+longTP  = tpMode == "ATR" ? avgPx + entryAtr * tpAtrMult : tpMode == "Fixed %" ? avgPx * (1 + tpPct / 100) : na
+shortTP = tpMode == "ATR" ? avgPx - entryAtr * tpAtrMult : tpMode == "Fixed %" ? avgPx * (1 - tpPct / 100) : na
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", "Long", stop=longSL, limit=longTP)
+if strategy.position_size < 0
+    strategy.exit("Short Exit", "Short", stop=shortSL, limit=shortTP)
+
+plot(kcMiddle, title="KC Middle", color=color.gray,  linewidth=1)
+plot(kcUpper,  title="KC Upper",  color=color.red,   linewidth=2)
+plot(kcLower,  title="KC Lower",  color=color.green, linewidth=2)
+
+plotshape(longCondition,  title="Long Signal Arrow",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small, text="BUY")
+plotshape(shortCondition, title="Short Signal Arrow", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small, text="SELL")
+
+if longCondition
+    alert("[Scalp Strategy] LONG on " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+if shortCondition
+    alert("[Scalp Strategy] SHORT on " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)

@@ -1,0 +1,96 @@
+//@version=6
+strategy("RSI VWAP + Extreme Reversal Strategy", shorttitle="RSIVWAP-ERS-S", overlay=true, max_labels_count=500,
+     initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     commission_type=strategy.commission.percent, commission_value=0.05, slippage=1,
+     process_orders_on_close=true)
+
+rsiLength       = input.int(15, "RSI VWAP Length",  minval=1,             group="RSI VWAP")
+oversoldLevel   = input.int(10, "Oversold Level",   minval=0, maxval=100, group="RSI VWAP")
+overboughtLevel = input.int(90, "Overbought Level", minval=0, maxval=100, group="RSI VWAP")
+
+ersMultiplier = input.float(3.0, "ERS Range Multiplier",     minval=0.1, step=0.1, group="Extreme Reversal Setup")
+ersLength     = input.int(14,    "ERS Lookback (avg range)", minval=2,             group="Extreme Reversal Setup")
+
+sigMode  = input.string("Window (recommended)", "Signal mode", options=["Window (recommended)", "Same bar (original)"], group="Signals")
+sigWin   = input.int(5, "Window: bars to look back for ERS + RSI extreme", minval=1, group="Signals")
+
+allowShort = input.bool(true,  "Allow Short trades", group="Exits")
+slLook     = input.int(5,      "Stop: beyond extreme of last N bars", minval=1, group="Exits")
+slBufPct   = input.float(0.1,  "Stop buffer %", minval=0.0, step=0.05, group="Exits")
+tpMode     = input.string("R Multiple", "Take Profit type", options=["R Multiple", "Session VWAP"], group="Exits")
+rrRatio    = input.float(2.0,  "Take Profit (x risk)", minval=0.1, step=0.1, group="Exits")
+exitOnOpp  = input.bool(true,  "Close on Opposite Signal", group="Exits")
+
+vwapLine = ta.vwap(hlc3)
+rsiVwap  = ta.rsi(vwapLine, rsiLength)
+
+greenCloud = rsiVwap > rsiVwap[1]
+redCloud   = rsiVwap < rsiVwap[1]
+turnGreen  = greenCloud and not greenCloud[1]
+turnRed    = redCloud   and not redCloud[1]
+
+barRange  = high - low
+avgRange  = ta.sma(barRange, ersLength)
+isExtreme = barRange >= ersMultiplier * avgRange
+
+ersBlue = isExtreme and close < open and low  < low[1]
+ersRed  = isExtreme and close > open and high > high[1]
+
+buySame  = rsiVwap < oversoldLevel   and greenCloud and ersBlue
+sellSame = rsiVwap > overboughtLevel and redCloud   and ersRed
+
+ersBlueRecent = ta.barssince(ersBlue) < sigWin
+ersRedRecent  = ta.barssince(ersRed)  < sigWin
+rsiWasOS      = ta.lowest(rsiVwap,  sigWin) < oversoldLevel
+rsiWasOB      = ta.highest(rsiVwap, sigWin) > overboughtLevel
+buyWin  = ersBlueRecent and rsiWasOS and turnGreen
+sellWin = ersRedRecent  and rsiWasOB and turnRed
+
+buySignal  = sigMode == "Same bar (original)" ? buySame  : buyWin
+sellSignal = sigMode == "Same bar (original)" ? sellSame : sellWin
+
+var float slLevel = na
+var float tpLevel = na
+
+if buySignal and strategy.position_size <= 0 and (strategy.position_size == 0 or exitOnOpp)
+    sl0  = ta.lowest(low, slLook) * (1 - slBufPct / 100)
+    risk = close - sl0
+    if risk > 0
+        slLevel := sl0
+        tpLevel := tpMode == "R Multiple" ? close + risk * rrRatio : na
+        strategy.entry("Long", strategy.long)
+        strategy.exit("Long Exit", "Long", stop=slLevel, limit=tpMode == "R Multiple" ? tpLevel : vwapLine, comment_loss="Stop", comment_profit="TP")
+        alert("BUY on " + syminfo.ticker + " @ " + str.tostring(close) + " | SL " + str.tostring(slLevel), alert.freq_once_per_bar_close)
+
+if sellSignal and allowShort and strategy.position_size >= 0 and (strategy.position_size == 0 or exitOnOpp)
+    sl0  = ta.highest(high, slLook) * (1 + slBufPct / 100)
+    risk = sl0 - close
+    if risk > 0
+        slLevel := sl0
+        tpLevel := tpMode == "R Multiple" ? close - risk * rrRatio : na
+        strategy.entry("Short", strategy.short)
+        strategy.exit("Short Exit", "Short", stop=slLevel, limit=tpMode == "R Multiple" ? tpLevel : vwapLine, comment_loss="Stop", comment_profit="TP")
+        alert("SELL on " + syminfo.ticker + " @ " + str.tostring(close) + " | SL " + str.tostring(slLevel), alert.freq_once_per_bar_close)
+
+if sellSignal and not allowShort and exitOnOpp and strategy.position_size > 0
+    strategy.close("Long", comment="Opp signal")
+
+if tpMode == "Session VWAP"
+    if strategy.position_size > 0
+        strategy.exit("Long Exit", "Long", stop=slLevel, limit=vwapLine, comment_loss="Stop", comment_profit="TP")
+    if strategy.position_size < 0
+        strategy.exit("Short Exit", "Short", stop=slLevel, limit=vwapLine, comment_loss="Stop", comment_profit="TP")
+
+inTrade = strategy.position_size != 0
+
+plot(vwapLine, "Session VWAP", color=color.new(color.blue, 0), linewidth=1)
+plot(inTrade ? slLevel : na, "Stop Loss", color=color.orange, style=plot.style_linebr)
+plot(inTrade ? (tpMode == "R Multiple" ? tpLevel : vwapLine) : na, "Take Profit", color=color.lime, style=plot.style_linebr)
+
+plotshape(buySignal,  title="Buy Signal",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0), size=size.small, text="BUY")
+plotshape(sellSignal, title="Sell Signal", style=shape.triangledown, location=location.abovebar, color=color.new(color.red,   0), size=size.small, text="SELL")
+
+plotshape(ersBlue, title="ERS Blue (bullish cue)", style=shape.circle, location=location.belowbar, color=color.new(color.blue, 0), size=size.tiny)
+plotshape(ersRed,  title="ERS Red (bearish cue)",  style=shape.circle, location=location.abovebar, color=color.new(color.red,  0), size=size.tiny)
+
+plot(rsiVwap, "RSI VWAP", display=display.data_window)

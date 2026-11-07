@@ -1,0 +1,108 @@
+//@version=6
+// SMI + EMA Trend Cloud Pullback Strategy
+//   Bias: 50/200 EMA cloud. Entry: SMI reclaims its band while on the right side of its signal EMA.
+//   Risk: SL beyond recent swing; TP = fixed R multiple (2.5R). Levels locked at entry.
+strategy(title                   = "SMI + EMA Trend Cloud Pullback",
+         shorttitle              = "SMI+Cloud",
+         overlay                 = false,
+         pyramiding              = 0,
+         default_qty_type        = strategy.percent_of_equity,
+         default_qty_value       = 10,
+         initial_capital         = 10000,
+         commission_type         = strategy.commission.percent,
+         commission_value        = 0.04,
+         calc_on_every_tick      = false,
+         process_orders_on_close = true)
+
+grpSMI    = "Stochastic Momentum Index"
+smiLenK   = input.int(10,    "SMI %K Length",           minval = 1, group = grpSMI)
+smiLenD   = input.int(3,     "SMI Smoothing (D)",       minval = 1, group = grpSMI)
+smiSigLen = input.int(10,    "SMI Signal EMA Length",   minval = 1, group = grpSMI)
+upperBand = input.float(40,  "Upper Band (Overbought)",             group = grpSMI)
+lowerBand = input.float(-40, "Lower Band (Oversold)",               group = grpSMI)
+
+grpEMA  = "EMA Trend Cloud"
+fastLen = input.int(50,  "Fast EMA Length", minval = 1, group = grpEMA)
+slowLen = input.int(200, "Slow EMA Length", minval = 1, group = grpEMA)
+
+grpRisk       = "Risk Management"
+swingLookback = input.int(10,     "Swing Lookback (bars)", minval = 1,               group = grpRisk)
+rrRatio       = input.float(2.5,  "Reward : Risk Ratio",   minval = 0.1, step = 0.1, group = grpRisk)
+bufferPct     = input.float(0.05, "Stop buffer beyond swing (%)", minval = 0.0, step = 0.01, group = grpRisk)
+
+emaFast   = ta.ema(close, fastLen)
+emaSlow   = ta.ema(close, slowLen)
+bullTrend = emaFast > emaSlow
+bearTrend = emaFast < emaSlow
+
+highestHigh = ta.highest(high, smiLenK)
+lowestLow   = ta.lowest(low,  smiLenK)
+rangeHL     = highestHigh - lowestLow
+relClose    = close - (highestHigh + lowestLow) / 2
+smoothRel   = ta.ema(ta.ema(relClose, smiLenD), smiLenD)
+smoothRange = ta.ema(ta.ema(rangeHL,  smiLenD), smiLenD)
+smi         = smoothRange != 0 ? 200 * (smoothRel / smoothRange) : 0.0
+smiSignal   = ta.ema(smi, smiSigLen)
+
+crossUpBand = ta.crossover(smi,  lowerBand)
+crossDnBand = ta.crossunder(smi, upperBand)
+
+longSignal  = bullTrend and crossUpBand and smi > smiSignal
+shortSignal = bearTrend and crossDnBand and smi < smiSignal
+
+recentSwingLow  = ta.lowest(low,  swingLookback)
+recentSwingHigh = ta.highest(high, swingLookback)
+buffer          = close * bufferPct / 100
+
+longStopCalc    = recentSwingLow - buffer
+longRiskCalc    = close - longStopCalc
+shortStopCalc   = recentSwingHigh + buffer
+shortRiskCalc   = shortStopCalc - close
+
+validLong  = longSignal  and longRiskCalc  > 0
+validShort = shortSignal and shortRiskCalc > 0
+
+var float slLevel = na
+var float tpLevel = na
+
+if validLong and strategy.position_size <= 0
+    slLevel := longStopCalc
+    tpLevel := close + longRiskCalc * rrRatio
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long TP/SL", from_entry = "Long", stop = slLevel, limit = tpLevel)
+    alert("SMI+Cloud: LONG on " + syminfo.ticker + " @ " + str.tostring(close) + " | SL " + str.tostring(slLevel) + " | TP " + str.tostring(tpLevel), alert.freq_once_per_bar_close)
+
+if validShort and strategy.position_size >= 0
+    slLevel := shortStopCalc
+    tpLevel := close - shortRiskCalc * rrRatio
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short TP/SL", from_entry = "Short", stop = slLevel, limit = tpLevel)
+    alert("SMI+Cloud: SHORT on " + syminfo.ticker + " @ " + str.tostring(close) + " | SL " + str.tostring(slLevel) + " | TP " + str.tostring(tpLevel), alert.freq_once_per_bar_close)
+
+inTrade = strategy.position_size != 0
+
+pFast = plot(emaFast, "Fast EMA (50)",  color = color.new(color.orange, 0), linewidth = 2, force_overlay = true)
+pSlow = plot(emaSlow, "Slow EMA (200)", color = color.new(color.blue,   0), linewidth = 2, force_overlay = true)
+cloudColor = bullTrend ? color.new(color.green, 80) : color.new(color.red, 80)
+fill(pFast, pSlow, color = cloudColor, title = "EMA Trend Cloud")
+
+plot(inTrade ? slLevel : na, "Stop Loss",   color = color.red,   style = plot.style_linebr, force_overlay = true)
+plot(inTrade ? tpLevel : na, "Take Profit", color = color.green, style = plot.style_linebr, force_overlay = true)
+
+plotshape(validLong,  title = "Long Entry",  location = location.belowbar, style = shape.triangleup,
+          color = color.green, size = size.small, text = "L", force_overlay = true)
+plotshape(validShort, title = "Short Entry", location = location.abovebar, style = shape.triangledown,
+          color = color.red,   size = size.small, text = "S", force_overlay = true)
+
+plot(smi,       "SMI",        color = color.new(color.teal, 0), linewidth = 2)
+plot(smiSignal, "SMI Signal", color = color.new(color.red,  0), linewidth = 1)
+hUpper = hline(upperBand, "Upper Band", color = color.new(color.gray, 40), linestyle = hline.style_dashed)
+hLower = hline(lowerBand, "Lower Band", color = color.new(color.gray, 40), linestyle = hline.style_dashed)
+hZero  = hline(0,         "Zero Line",  color = color.new(color.gray, 70), linestyle = hline.style_dotted)
+fill(hUpper, hZero, color = color.new(color.red,   92), title = "Overbought Zone")
+fill(hLower, hZero, color = color.new(color.green, 92), title = "Oversold Zone")
+
+plotshape(validLong,  title = "SMI Long Trigger",  location = location.bottom, style = shape.labelup,
+          color = color.new(color.green, 0), textcolor = color.white, text = "▲")
+plotshape(validShort, title = "SMI Short Trigger", location = location.top,    style = shape.labeldown,
+          color = color.new(color.red, 0),   textcolor = color.white, text = "▼")

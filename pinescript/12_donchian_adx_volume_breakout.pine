@@ -1,0 +1,97 @@
+//@version=6
+// Donchian Channel Breakout + ADX Trend Strength + Volume Confirmation (BTCUSDT 1H/4H)
+strategy("Donchian ADX Volume Breakout Strategy [BTCUSDT 1H/4H]",
+     shorttitle              = "DC-ADX-VOL Strat",
+     overlay                 = false,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 10,
+     pyramiding              = 0,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.05,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false)
+
+grpDC     = "Donchian Channel"
+dcLength  = input.int(20, "Donchian Length", minval = 1, group = grpDC)
+entryMode = input.string("Middle Band Cross", "Entry trigger",
+     options = ["Middle Band Cross", "Channel Breakout"], group = grpDC)
+
+grpADX       = "ADX Trend Filter"
+adxLength    = input.int(14,   "ADX (DI) Length",              minval = 1, group = grpADX)
+adxSmoothing = input.int(14,   "ADX Smoothing",                minval = 1, group = grpADX)
+adxThreshold = input.float(25, "ADX Trend Strength Threshold", minval = 0, group = grpADX)
+
+grpVol    = "Volume Confirmation"
+volLength = input.int(10, "Volume SMA Length", minval = 1, group = grpVol)
+
+grpRisk    = "Risk Management"
+rrRatio    = input.float(1.5, "Risk : Reward Ratio (TP = RR * Risk)", minval = 0.1, step = 0.1, group = grpRisk)
+useMidExit = input.bool(true, "Exit when price crosses back over the middle band", group = grpRisk)
+
+upperDC  = ta.highest(high, dcLength)
+lowerDC  = ta.lowest(low, dcLength)
+middleDC = (upperDC + lowerDC) / 2
+
+[diPlus, diMinus, adxValue] = ta.dmi(adxLength, adxSmoothing)
+
+volumeSMA = ta.sma(volume, volLength)
+
+midCrossUp   = ta.crossover(close,  middleDC)
+midCrossDown = ta.crossunder(close, middleDC)
+dcBreakUp    = close > upperDC[1]
+dcBreakDown  = close < lowerDC[1]
+
+longTrigger  = entryMode == "Middle Band Cross" ? midCrossUp   : dcBreakUp
+shortTrigger = entryMode == "Middle Band Cross" ? midCrossDown : dcBreakDown
+
+trendStrongEnough = adxValue > adxThreshold
+volumeConfirmed   = volume > volumeSMA
+
+longCondition  = longTrigger  and trendStrongEnough and volumeConfirmed
+shortCondition = shortTrigger and trendStrongEnough and volumeConfirmed
+
+var float slLevel = na
+var float tpLevel = na
+
+if longCondition and strategy.position_size <= 0
+    riskLong = close - lowerDC
+    if riskLong > 0
+        slLevel := lowerDC
+        tpLevel := close + rrRatio * riskLong
+        strategy.entry("Long", strategy.long)
+        strategy.exit("Long Exit", "Long", stop = slLevel, limit = tpLevel)
+        alert("DC-ADX: LONG on " + syminfo.ticker + " @ " + str.tostring(close) + " | SL " + str.tostring(slLevel) + " | TP " + str.tostring(tpLevel), alert.freq_once_per_bar_close)
+
+if shortCondition and strategy.position_size >= 0
+    riskShort = upperDC - close
+    if riskShort > 0
+        slLevel := upperDC
+        tpLevel := close - rrRatio * riskShort
+        strategy.entry("Short", strategy.short)
+        strategy.exit("Short Exit", "Short", stop = slLevel, limit = tpLevel)
+        alert("DC-ADX: SHORT on " + syminfo.ticker + " @ " + str.tostring(close) + " | SL " + str.tostring(slLevel) + " | TP " + str.tostring(tpLevel), alert.freq_once_per_bar_close)
+
+if useMidExit and strategy.position_size > 0 and midCrossDown
+    strategy.close("Long", comment = "Mid-Band Cross Exit")
+if useMidExit and strategy.position_size < 0 and midCrossUp
+    strategy.close("Short", comment = "Mid-Band Cross Exit")
+
+inTrade = strategy.position_size != 0
+
+plot(upperDC,  "Upper Donchian Band",  color = color.new(color.teal,   0), linewidth = 1, force_overlay = true)
+plot(lowerDC,  "Lower Donchian Band",  color = color.new(color.red,    0), linewidth = 1, force_overlay = true)
+plot(middleDC, "Middle Donchian Band", color = color.new(color.orange, 0), linewidth = 1, force_overlay = true)
+
+plot(inTrade ? slLevel : na, "Stop Loss",   color = color.red,   style = plot.style_linebr, force_overlay = true)
+plot(inTrade ? tpLevel : na, "Take Profit", color = color.green, style = plot.style_linebr, force_overlay = true)
+
+plotshape(longCondition,  title = "Long Signal",  style = shape.triangleup,   location = location.belowbar,
+     color = color.new(color.green, 0), size = size.small, text = "Long",  force_overlay = true)
+plotshape(shortCondition, title = "Short Signal", style = shape.triangledown, location = location.abovebar,
+     color = color.new(color.red, 0),   size = size.small, text = "Short", force_overlay = true)
+
+plot(adxValue, "ADX", color = color.new(color.purple, 0), linewidth = 2)
+plot(diPlus,   "+DI", color = color.new(color.green, 40), linewidth = 1)
+plot(diMinus,  "-DI", color = color.new(color.red,   40), linewidth = 1)
+hline(adxThreshold, "ADX Threshold", color = color.new(color.gray, 0), linestyle = hline.style_dashed)

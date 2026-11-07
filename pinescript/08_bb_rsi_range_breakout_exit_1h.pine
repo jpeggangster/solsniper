@@ -1,0 +1,104 @@
+//@version=6
+// Bollinger Bands + RSI - Mean-Reversion Range Strategy (BTCUSDT 1H, any symbol/TF)
+//   LONG  : close below lower band AND RSI < 30
+//   SHORT : close above upper band AND RSI > 70
+//   TP    : basis (20 SMA); SL: % buffer beyond entry band (frozen at entry)
+//   Breakout exit: RSI < 20 / > 80 while price still closes outside the band
+strategy(
+     title                   = "BB + RSI Range Strategy",
+     shorttitle              = "BB+RSI Range",
+     overlay                 = false,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 100,
+     pyramiding              = 0,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.04,
+     slippage                = 1,
+     calc_on_every_tick      = false,
+     process_orders_on_close = false)
+
+var string GRP_BB = "Bollinger Bands"
+bbLength = input.int(20,      "Length",           minval = 1,               group = GRP_BB)
+bbMult   = input.float(2.0,   "Std-Dev multiple", minval = 0.1, step = 0.1, group = GRP_BB)
+bbSrc    = input.source(close, "Source",                                    group = GRP_BB)
+
+var string GRP_RSI = "RSI"
+rsiLength     = input.int(14,   "Length",                     minval = 1,              group = GRP_RSI)
+rsiOversold   = input.float(30, "Oversold  (long trigger)",   minval = 1, maxval = 99, group = GRP_RSI)
+rsiOverbought = input.float(70, "Overbought (short trigger)", minval = 1, maxval = 99, group = GRP_RSI)
+
+var string GRP_BRK = "Breakout Exit"
+rsiLongBreakout  = input.float(20, "Exit LONG  when RSI drops below", minval = 1, maxval = 99, group = GRP_BRK)
+rsiShortBreakout = input.float(80, "Exit SHORT when RSI rises above", minval = 1, maxval = 99, group = GRP_BRK)
+
+var string GRP_SL = "Stop Loss"
+slBufferPerc = input.float(0.5, "Buffer beyond entry band (%)", minval = 0.0, step = 0.1, group = GRP_SL)
+
+var string GRP_DIR = "Trade Filters"
+tradeDir = input.string("Both", "Allowed direction", options = ["Both", "Long only", "Short only"], group = GRP_DIR)
+
+allowLong  = tradeDir == "Both" or tradeDir == "Long only"
+allowShort = tradeDir == "Both" or tradeDir == "Short only"
+
+basis = ta.sma(bbSrc, bbLength)
+dev   = bbMult * ta.stdev(bbSrc, bbLength)
+upper = basis + dev
+lower = basis - dev
+
+rsiValue = ta.rsi(close, rsiLength)
+
+flat = strategy.position_size == 0
+
+longSignal  = close < lower and rsiValue < rsiOversold
+shortSignal = close > upper and rsiValue > rsiOverbought
+
+longBreakoutExit  = strategy.position_size > 0 and rsiValue < rsiLongBreakout  and close < lower
+shortBreakoutExit = strategy.position_size < 0 and rsiValue > rsiShortBreakout and close > upper
+
+var float longStop  = na
+var float shortStop = na
+
+if longSignal and flat and allowLong
+    strategy.entry("Long", strategy.long)
+    longStop := lower * (1.0 - slBufferPerc / 100.0)
+    alert("BB+RSI: LONG entry on " + syminfo.ticker + " @ " + str.tostring(close) + " | stop " + str.tostring(longStop), alert.freq_once_per_bar_close)
+
+if shortSignal and flat and allowShort
+    strategy.entry("Short", strategy.short)
+    shortStop := upper * (1.0 + slBufferPerc / 100.0)
+    alert("BB+RSI: SHORT entry on " + syminfo.ticker + " @ " + str.tostring(close) + " | stop " + str.tostring(shortStop), alert.freq_once_per_bar_close)
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", from_entry = "Long", stop = longStop, limit = basis)
+
+if strategy.position_size < 0
+    strategy.exit("Short Exit", from_entry = "Short", stop = shortStop, limit = basis)
+
+if longBreakoutExit
+    strategy.close("Long", comment = "Breakout exit")
+    alert("BB+RSI: LONG breakout exit on " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+if shortBreakoutExit
+    strategy.close("Short", comment = "Breakout exit")
+    alert("BB+RSI: SHORT breakout exit on " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+pUpper = plot(upper, "BB Upper",          color = color.new(color.teal,   0), linewidth = 1, force_overlay = true)
+pBasis = plot(basis, "BB Basis (20 SMA)", color = color.new(color.orange, 0), linewidth = 1, force_overlay = true)
+pLower = plot(lower, "BB Lower",          color = color.new(color.teal,   0), linewidth = 1, force_overlay = true)
+fill(pUpper, pLower, color = color.new(color.teal, 92), title = "BB Channel")
+
+plot(strategy.position_size > 0 ? longStop  : na, "Long Stop",  color = color.red, style = plot.style_linebr, force_overlay = true)
+plot(strategy.position_size < 0 ? shortStop : na, "Short Stop", color = color.red, style = plot.style_linebr, force_overlay = true)
+
+plotshape(longSignal,  title = "Long Entry Signal",  style = shape.triangleup,
+     location = location.belowbar, color = color.new(color.green, 0), size = size.small, force_overlay = true)
+plotshape(shortSignal, title = "Short Entry Signal", style = shape.triangledown,
+     location = location.abovebar, color = color.new(color.red, 0),   size = size.small, force_overlay = true)
+
+plot(rsiValue, "RSI", color = color.new(color.purple, 0), linewidth = 2)
+hline(rsiOverbought,    "RSI Overbought",     color = color.new(color.red,   50), linestyle = hline.style_dashed)
+hline(rsiOversold,      "RSI Oversold",       color = color.new(color.green, 50), linestyle = hline.style_dashed)
+hline(rsiShortBreakout, "RSI Breakout High",  color = color.new(color.red,   70), linestyle = hline.style_dotted)
+hline(rsiLongBreakout,  "RSI Breakout Low",   color = color.new(color.green, 70), linestyle = hline.style_dotted)
+hline(50,               "RSI Mid",            color = color.new(color.gray,  70), linestyle = hline.style_dotted)

@@ -1,0 +1,73 @@
+//@version=6
+strategy("Mean Reversion Scalper [1m] Strategy", shorttitle="MRS-S", overlay=true,
+     initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     commission_type=strategy.commission.percent, commission_value=0.05, slippage=1)
+
+bbLength  = input.int(20,    "BB Length",  minval=1,   group="Bollinger Bands")
+bbStdDev  = input.float(2.0, "BB StdDev",  minval=0.1, group="Bollinger Bands")
+
+rsiLen    = input.int(14, "RSI Length",          minval=1, group="Stochastic RSI")
+stochLen  = input.int(14, "Stoch Length",        minval=1, group="Stochastic RSI")
+smoothK   = input.int(3,  "Stoch %K Smoothing",  minval=1, group="Stochastic RSI")
+smoothD   = input.int(3,  "Stoch %D Smoothing",  minval=1, group="Stochastic RSI")
+stochOS   = input.float(25, "Stoch Oversold level",   group="Stochastic RSI")
+stochOB   = input.float(75, "Stoch Overbought level", group="Stochastic RSI")
+
+volLen    = input.int(15, "Volume MA Length", minval=1, group="Volume")
+
+allowShort = input.bool(true, "Allow Short Trades", group="Exits")
+tpMode     = input.string("BB Basis", "Take Profit target", options=["BB Basis", "Opposite Band", "Fixed %"], group="Exits")
+tpPct      = input.float(0.5, "Take Profit % (Fixed % mode)", minval=0.05, step=0.05, group="Exits")
+useSL      = input.bool(true, "Use Stop Loss", group="Exits")
+slPct      = input.float(0.3, "Stop Loss %", minval=0.05, step=0.05, group="Exits")
+exitOnOpp  = input.bool(true, "Close on Opposite Signal", group="Exits")
+
+[bbMiddle, bbUpper, bbLower] = ta.bb(close, bbLength, bbStdDev)
+plot(bbMiddle, title="BB Basis",      color=color.blue, linewidth=1)
+plot(bbUpper,  title="BB Upper Line", color=color.red,  linewidth=2)
+plot(bbLower,  title="BB Lower Line", color=color.red,  linewidth=2)
+
+rsiValue = ta.rsi(close, rsiLen)
+stochK   = ta.sma(ta.stoch(rsiValue, rsiValue, rsiValue, stochLen), smoothK)
+stochD   = ta.sma(stochK, smoothD)
+
+volMA    = ta.sma(volume, volLen)
+volGreen = close > open
+volRed   = close < open
+volHigh  = volume > volMA
+
+longBB     = low <= bbLower
+longStoch  = stochK > stochD and stochK > stochK[1] and stochK[1] < stochOS
+longSignal = longBB and longStoch and volHigh and volGreen
+
+shortBB     = high >= bbUpper
+shortStoch  = stochK < stochD and stochK < stochK[1] and stochK[1] > stochOB
+shortSignal = shortBB and shortStoch and volHigh and volRed
+
+if longSignal and (strategy.position_size >= 0 or exitOnOpp)
+    strategy.entry("Long", strategy.long)
+
+if shortSignal
+    if allowShort and (strategy.position_size <= 0 or exitOnOpp)
+        strategy.entry("Short", strategy.short)
+    else if not allowShort and exitOnOpp and strategy.position_size > 0
+        strategy.close("Long", comment="Opp signal")
+
+avgPx = strategy.position_avg_price
+longTP  = tpMode == "BB Basis" ? bbMiddle : tpMode == "Opposite Band" ? bbUpper : avgPx * (1 + tpPct / 100)
+shortTP = tpMode == "BB Basis" ? bbMiddle : tpMode == "Opposite Band" ? bbLower : avgPx * (1 - tpPct / 100)
+longSL  = useSL ? avgPx * (1 - slPct / 100) : na
+shortSL = useSL ? avgPx * (1 + slPct / 100) : na
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", "Long", stop=longSL, limit=longTP)
+if strategy.position_size < 0
+    strategy.exit("Short Exit", "Short", stop=shortSL, limit=shortTP)
+
+plotshape(longSignal,  title="Long Signal Arrow",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small)
+plotshape(shortSignal, title="Short Signal Arrow", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small)
+
+if longSignal
+    alert("LONG on " + syminfo.ticker + " @ " + str.tostring(close) + ": Lower BB touch + StochRSI bullish exit + high green volume", alert.freq_once_per_bar_close)
+if shortSignal
+    alert("SHORT on " + syminfo.ticker + " @ " + str.tostring(close) + ": Upper BB touch + StochRSI bearish exit + high red volume", alert.freq_once_per_bar_close)

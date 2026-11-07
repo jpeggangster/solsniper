@@ -1,0 +1,152 @@
+//@version=6
+strategy("Donchian + LWTI + Volume Strategy v2", shorttitle="DC-LWTI-S2", overlay=false, max_bars_back=500,
+     initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     commission_type=strategy.commission.percent, commission_value=0.05, slippage=1,
+     process_orders_on_close=true)
+
+// INPUTS
+dcLength      = input.int(96, "Donchian Length", minval=1, group="Donchian")
+confirmClose  = input.bool(true, "Require CLOSE beyond channel (not just a wick)", group="Donchian")
+
+lwtiMode      = input.string("TradingView LWTI", "LWTI formula", options=["TradingView LWTI", "Stochastic (original script)"], group="LWTI")
+lwtiPeriod    = input.int(25, "LWTI Period",           minval=1, group="LWTI")
+lwtiSmoothing = input.int(20, "LWTI Smoothing Period", minval=1, group="LWTI")
+
+volMaLength   = input.int(30, "Volume MA Length", minval=1, group="Volume")
+
+useHtf   = input.bool(true, "Higher-timeframe trend filter", group="Filters")
+htfTf    = input.timeframe("60", "HTF timeframe",            group="Filters")
+htfLen   = input.int(200, "HTF EMA length", minval=1,         group="Filters")
+useAdx   = input.bool(true, "ADX chop filter",                group="Filters")
+adxMin   = input.float(20, "Min ADX to trade", minval=0,      group="Filters")
+cooldown = input.int(3, "Cooldown bars after an exit", minval=0, group="Filters")
+
+allowShort = input.bool(true, "Allow Short trades", group="Exits")
+slMode     = input.string("DC Middle (trailing)", "Stop Loss type", options=["DC Middle (trailing)", "ATR", "Fixed %"], group="Exits")
+atrLen     = input.int(14,    "ATR Length",        minval=1,                group="Exits")
+atrMult    = input.float(2.0, "Stop (x ATR)",      minval=0.1, step=0.1,    group="Exits")
+slPct      = input.float(2.0, "Stop Loss %",       minval=0.1, step=0.1,    group="Exits")
+useTP      = input.bool(true, "Use Take Profit (R multiple)",               group="Exits")
+rrRatio    = input.float(2.0, "Take Profit (x risk)", minval=0.1, step=0.1, group="Exits")
+useBE      = input.bool(true, "Move stop to breakeven after +R",            group="Exits")
+beTrigger  = input.float(1.0, "Breakeven trigger (x risk)", minval=0.1, step=0.1, group="Exits")
+beBuffer   = input.float(0.1, "Breakeven buffer % (covers fees)", minval=0.0, step=0.01, group="Exits")
+exitOnLwti = input.bool(false, "Exit when LWTI flips across 50",            group="Exits")
+
+// DONCHIAN
+dcUpper  = ta.highest(high, dcLength)
+dcLower  = ta.lowest(low, dcLength)
+dcMiddle = math.avg(dcUpper, dcLower)
+
+// LWTI
+lwtiMa  = ta.sma(close - close[lwtiPeriod], lwtiSmoothing)
+lwtiAtr = ta.atr(lwtiSmoothing)
+lwtiTV  = lwtiAtr != 0 ? lwtiMa / lwtiAtr * 50 + 50 : 50.0
+
+lwtiHH    = ta.highest(high, lwtiPeriod)
+lwtiLL    = ta.lowest(low,  lwtiPeriod)
+lwtiRange = lwtiHH - lwtiLL
+lwtiStoch = ta.ema(lwtiRange != 0 ? (close - lwtiLL) / lwtiRange * 100 : 50.0, lwtiSmoothing)
+
+lwti      = lwtiMode == "TradingView LWTI" ? lwtiTV : lwtiStoch
+lwtiGreen = lwti >= 50
+lwtiRed   = lwti < 50
+
+// VOLUME
+volMA      = ta.sma(volume, volMaLength)
+volIsGreen = close > open
+volIsRed   = close < open
+volAboveMA = volume > volMA
+
+// FILTERS (HTF uses last COMPLETED higher-timeframe bar -> no repainting)
+htfClose = request.security(syminfo.tickerid, htfTf, close[1],                 lookahead=barmerge.lookahead_on)
+htfEma   = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfLen)[1], lookahead=barmerge.lookahead_on)
+htfLongOK  = not useHtf or htfClose > htfEma
+htfShortOK = not useHtf or htfClose < htfEma
+
+[diP, diM, adx] = ta.dmi(14, 14)
+adxOK = not useAdx or adx > adxMin
+
+var int lastExitBar = -1000
+if strategy.closedtrades > strategy.closedtrades[1]
+    lastExitBar := bar_index
+cooldownOK = bar_index - lastExitBar > cooldown
+
+// SIGNALS
+breakUp   = confirmClose ? close > dcUpper[1] : high >= dcUpper
+breakDown = confirmClose ? close < dcLower[1] : low  <= dcLower
+
+longSignal  = breakUp   and lwtiGreen and volAboveMA and volIsGreen and htfLongOK  and adxOK and cooldownOK
+shortSignal = breakDown and lwtiRed   and volAboveMA and volIsRed   and htfShortOK and adxOK and cooldownOK
+
+// ORDERS
+atr = ta.atr(atrLen)
+
+var float slLevel = na
+var float tpLevel = na
+var float entryPx = na
+var float riskAmt = na
+
+if longSignal and strategy.position_size <= 0
+    sl0  = slMode == "DC Middle (trailing)" ? dcMiddle : slMode == "ATR" ? close - atr * atrMult : close * (1 - slPct / 100)
+    risk = close - sl0
+    if risk > 0
+        entryPx := close
+        riskAmt := risk
+        slLevel := sl0
+        tpLevel := useTP ? close + risk * rrRatio : na
+        strategy.entry("Long", strategy.long)
+        strategy.exit("Long Exit", "Long", stop=slLevel, limit=tpLevel, comment_loss="Stop", comment_profit="TP")
+        alert("LONG on " + syminfo.ticker + " @ " + str.tostring(close) + " | SL " + str.tostring(slLevel), alert.freq_once_per_bar_close)
+
+if shortSignal and allowShort and strategy.position_size >= 0
+    sl0  = slMode == "DC Middle (trailing)" ? dcMiddle : slMode == "ATR" ? close + atr * atrMult : close * (1 + slPct / 100)
+    risk = sl0 - close
+    if risk > 0
+        entryPx := close
+        riskAmt := risk
+        slLevel := sl0
+        tpLevel := useTP ? close - risk * rrRatio : na
+        strategy.entry("Short", strategy.short)
+        strategy.exit("Short Exit", "Short", stop=slLevel, limit=tpLevel, comment_loss="Stop", comment_profit="TP")
+        alert("SHORT on " + syminfo.ticker + " @ " + str.tostring(close) + " | SL " + str.tostring(slLevel), alert.freq_once_per_bar_close)
+
+if strategy.position_size > 0
+    if slMode == "DC Middle (trailing)"
+        slLevel := math.max(slLevel, dcMiddle)
+    if useBE and high >= entryPx + riskAmt * beTrigger
+        slLevel := math.max(slLevel, entryPx * (1 + beBuffer / 100))
+    strategy.exit("Long Exit", "Long", stop=slLevel, limit=tpLevel, comment_loss="Stop", comment_profit="TP")
+    if exitOnLwti and lwtiRed
+        strategy.close("Long", comment="LWTI flip")
+
+if strategy.position_size < 0
+    if slMode == "DC Middle (trailing)"
+        slLevel := math.min(slLevel, dcMiddle)
+    if useBE and low <= entryPx - riskAmt * beTrigger
+        slLevel := math.min(slLevel, entryPx * (1 - beBuffer / 100))
+    strategy.exit("Short Exit", "Short", stop=slLevel, limit=tpLevel, comment_loss="Stop", comment_profit="TP")
+    if exitOnLwti and lwtiGreen
+        strategy.close("Short", comment="LWTI flip")
+
+inTrade = strategy.position_size != 0
+
+// PRICE CHART PLOTS
+plot(dcUpper,  "DC Upper",  color=color.red,  force_overlay=true)
+plot(dcLower,  "DC Lower",  color=color.red,  force_overlay=true)
+plot(dcMiddle, "DC Middle", color=color.gray, force_overlay=true)
+plot(useHtf ? htfEma : na, "HTF EMA", color=color.yellow, linewidth=2, force_overlay=true)
+
+plot(inTrade ? slLevel : na, "Stop Loss",   color=color.orange, style=plot.style_linebr, force_overlay=true)
+plot(inTrade ? tpLevel : na, "Take Profit", color=color.lime,   style=plot.style_linebr, force_overlay=true)
+
+plotshape(longSignal,  "Long Signal",  shape.triangleup,   location.belowbar, color.green, size=size.small, force_overlay=true)
+plotshape(shortSignal, "Short Signal", shape.triangledown, location.abovebar, color.red,   size=size.small, force_overlay=true)
+
+// PANE: LWTI + scaled volume
+plot(lwti, "LWTI", color=lwtiGreen ? color.green : color.red, linewidth=2)
+hline(50, "LWTI Midline", color=color.gray, linestyle=hline.style_dashed)
+
+volScale = ta.highest(volume, 100)
+plot(volScale > 0 ? volume / volScale * 25 : 0.0, "Volume (scaled)", color=volIsGreen ? color.new(color.green, 50) : color.new(color.red, 50), style=plot.style_columns)
+plot(volScale > 0 ? volMA  / volScale * 25 : 0.0, "Volume MA (scaled)", color=color.white)
